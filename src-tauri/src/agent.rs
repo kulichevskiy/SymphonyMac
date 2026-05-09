@@ -1,6 +1,7 @@
 mod pipeline;
 mod process;
 mod prompt;
+mod red_gate;
 mod runtime;
 
 use self::pipeline::{

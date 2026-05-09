@@ -33,14 +33,44 @@ Title: {{issue_title}}
 Description:
 {{issue_body}}
 
-Instructions:
-1. Analyze the issue carefully
-2. Implement the fix or feature with clean, well-structured code
-3. Commit your changes with a descriptive message
-4. Create a Pull Request:
+Follow strict TDD red-green-refactor. The pipeline runs a machine red-gate \
+after this stage that walks your commits and verifies the first commit \
+contains a *failing* test. If you skip the red step, this stage will fail \
+and be retried.
+
+Required commit structure:
+
+1. **Commit 1 — RED (failing test only).**
+   Add or modify ONLY test files (under `tests/`, `__tests__/`, or matching \
+`*.test.*` / `*.spec.*` / `*_test.go` / `*_test.rs` / `test_*.py` / \
+`*Tests.swift`). Do NOT touch production source files in this commit. \
+The test must describe the behavior the issue asks for and must FAIL when \
+run.
+   Commit message convention: `test: <what fails>` or `red: <what fails>`.
+
+2. **Commit 2 — GREEN (minimal production code).**
+   Add the minimum production code needed to make the failing test pass. \
+Keep the change tightly scoped to the test.
+   Commit message convention: `feat:`, `fix:`, or `green:` prefix.
+
+3. **Commit 3 — REFACTOR (optional).**
+   Only if the code can be improved without changing behavior, commit a \
+clean-up. Skip this commit entirely if no refactor is needed.
+
+Hard rules:
+- The first commit on this branch MUST modify ONLY test files. \
+Mixed first commits (production + test in the same commit) fail the red-gate.
+- Do NOT amend or squash these commits. The gate inspects them individually.
+- If the issue is purely documentation or configuration (no production code \
+files change), the red-gate is auto-skipped — you may use a single descriptive \
+commit instead.
+
+After all commits, open the Pull Request:
    gh pr create --title \"Fix #{{issue_number}}: {{issue_title}}\" --body \"Closes #{{issue_number}}\"
 
-Do NOT run tests - that will be handled in a later stage.",
+Do NOT run the full test suite yourself — the Testing stage handles that. \
+You may run a single targeted test invocation to confirm the red commit \
+fails before moving to green.",
 
         PipelineStage::CodeReview => "\
 You are a code reviewer for repository {{repo}}.
@@ -136,6 +166,67 @@ exit with a non-zero exit code so the pipeline knows the merge did not succeed."
     }
 }
 
+/// Marker prefix the red-gate uses on retry `previous_error` strings so the
+/// prompt builder can swap in the TDD-reinforcement variant.
+pub(crate) const RED_GATE_RETRY_MARKER: &str = "[red-gate-failure]";
+
+/// Aggressive reinforcement prompt used when the red-gate failed on the prior
+/// Implement attempt. Re-states the contract in stronger terms and forces the
+/// agent to start the branch over.
+fn implement_reinforcement_prompt() -> &'static str {
+    "\
+You are RETRYING GitHub issue #{{issue_number}} in repository {{repo}} \
+after the previous Implement attempt FAILED the TDD red-gate.
+
+Title: {{issue_title}}
+
+Description:
+{{issue_body}}
+
+The previous attempt produced commits that the red-gate could not accept. \
+Specifically: {{previous_error}}
+
+You MUST follow this protocol exactly. There is no flexibility:
+
+STEP 0 — RESET THE BRANCH.
+Discard the prior attempt's commits before doing anything else. From the \
+workspace root, run:
+   git fetch origin
+   git reset --hard origin/main
+This wipes the failed attempt so the gate sees a clean history.
+
+STEP 1 — RED COMMIT (TEST ONLY).
+Write or modify exactly one test that captures the issue's behavior and \
+WILL FAIL when run. Touch ONLY files matching test conventions:
+   - under `tests/`, `__tests__/`, or `test/`
+   - filename like `*.test.ts`, `*.spec.tsx`, `*_test.go`, `*_test.rs`, \
+`test_*.py`, `*Tests.swift`
+DO NOT touch any production source file in this commit. Then:
+   git add <test files only>
+   git commit -m \"test: <one-line description of failing behavior>\"
+
+STEP 2 — GREEN COMMIT (PRODUCTION CODE).
+Add the smallest production-code change that makes the red test pass. \
+Then:
+   git add <production files>
+   git commit -m \"feat: <one-line description>\"
+
+STEP 3 — OPTIONAL REFACTOR.
+Only if needed, commit refactors that do not change behavior.
+
+STEP 4 — OPEN THE PR.
+   gh pr create --title \"Fix #{{issue_number}}: {{issue_title}}\" --body \
+\"Closes #{{issue_number}}\"
+
+Hard rules — violating any of these fails the gate again:
+- Commit 1 must touch zero production files. The red-gate uses path heuristics \
+(any `.ts`/`.tsx`/`.rs`/`.py`/`.go`/`.swift` outside `tests/`, `__tests__/`, \
+`test/` and not matching the test-name conventions above is treated as \
+production).
+- Do NOT amend, squash, or rebase these commits.
+- Do NOT skip the red step \"because it's obvious.\""
+}
+
 pub(crate) fn build_prompt(
     stage: &PipelineStage,
     issue_number: u64,
@@ -148,10 +239,20 @@ pub(crate) fn build_prompt(
     previous_context: Option<&StageContext>,
 ) -> String {
     let stage_key = stage.to_string();
-    let template = match stage_prompts.get(&stage_key) {
-        Some(custom) if !custom.trim().is_empty() => custom.as_str(),
-        _ => default_prompt(stage),
+    let custom_template = stage_prompts
+        .get(&stage_key)
+        .map(|template| template.as_str())
+        .filter(|template| !template.trim().is_empty());
+
+    let red_gate_retry = matches!(stage, PipelineStage::Implement)
+        && previous_error.starts_with(RED_GATE_RETRY_MARKER);
+
+    let template: &str = if red_gate_retry && custom_template.is_none() {
+        implement_reinforcement_prompt()
+    } else {
+        custom_template.unwrap_or_else(|| default_prompt(stage))
     };
+
     let mut rendered = render_template(
         template,
         issue_number,
@@ -376,6 +477,100 @@ mod tests {
             prompt,
             "Custom test plan for pedrocid/SymphonyMac issue #62"
         );
+    }
+
+    #[test]
+    fn implement_default_prompt_describes_red_green_refactor_structure() {
+        let prompt = build_prompt(
+            &PipelineStage::Implement,
+            7,
+            "kulichevskiy/SymphonyMac",
+            "TDD: red-green-refactor Implement prompt + machine red-gate",
+            "Add a TDD red-gate.",
+            &HashMap::new(),
+            1,
+            "",
+            None,
+        );
+
+        assert!(prompt.contains("RED (failing test only)"));
+        assert!(prompt.contains("GREEN (minimal production code)"));
+        assert!(prompt.contains("REFACTOR"));
+        // Hard rule about test-only first commit must be present.
+        assert!(prompt.contains("MUST modify ONLY test files"));
+    }
+
+    #[test]
+    fn implement_retry_swaps_in_reinforcement_when_red_gate_marker_present() {
+        use super::RED_GATE_RETRY_MARKER;
+
+        let previous_error =
+            format!("{} no test-only commit found", RED_GATE_RETRY_MARKER);
+
+        let prompt = build_prompt(
+            &PipelineStage::Implement,
+            7,
+            "kulichevskiy/SymphonyMac",
+            "TDD: red-green-refactor",
+            "body",
+            &HashMap::new(),
+            2,
+            &previous_error,
+            None,
+        );
+
+        assert!(prompt.contains("RETRYING GitHub issue"));
+        assert!(prompt.contains("git reset --hard origin/main"));
+        // The previous_error placeholder still gets rendered into the prompt.
+        assert!(prompt.contains("no test-only commit found"));
+    }
+
+    #[test]
+    fn implement_retry_keeps_custom_prompt_when_user_overrode_it() {
+        use super::RED_GATE_RETRY_MARKER;
+
+        let mut stage_prompts = HashMap::new();
+        stage_prompts.insert(
+            "implement".to_string(),
+            "Custom implement plan for {{repo}} attempt {{attempt}}".to_string(),
+        );
+
+        let previous_error =
+            format!("{} red gate failed", RED_GATE_RETRY_MARKER);
+
+        let prompt = build_prompt(
+            &PipelineStage::Implement,
+            7,
+            "kulichevskiy/SymphonyMac",
+            "title",
+            "body",
+            &stage_prompts,
+            2,
+            &previous_error,
+            None,
+        );
+
+        // Custom override wins — we don't surprise users who configured their own template.
+        assert!(prompt.contains("Custom implement plan"));
+        assert!(!prompt.contains("RETRYING GitHub issue"));
+    }
+
+    #[test]
+    fn non_red_gate_retries_use_the_default_prompt() {
+        let prompt = build_prompt(
+            &PipelineStage::Implement,
+            7,
+            "kulichevskiy/SymphonyMac",
+            "title",
+            "body",
+            &HashMap::new(),
+            2,
+            "agent crashed",
+            None,
+        );
+
+        assert!(prompt.contains("RED (failing test only)"));
+        assert!(!prompt.contains("RETRYING GitHub issue"));
     }
 
     #[test]
