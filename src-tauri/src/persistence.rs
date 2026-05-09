@@ -242,6 +242,8 @@ mod tests {
             review_iteration: 0,
             last_ci_failure_sha: None,
             ci_status_fetch_failure_count: 0,
+            last_trigger_signature: None,
+            last_trigger_summary: None,
         }
     }
 

@@ -32,6 +32,8 @@ export interface RunConfig {
   codex_feedback_marker: string;
   local_repos: Record<string, string>;
   custom_agent_command: string;
+  max_review_iterations: number;
+  cost_cap_per_issue_usd: number;
 }
 
 export interface AgentRun {
@@ -57,6 +59,9 @@ export interface AgentRun {
   log_count?: number;
   activity?: string | null;
   review_iteration?: number;
+  cost_usd?: number;
+  issue_cost_usd?: number;
+  last_trigger_summary?: string | null;
 }
 
 export interface Issue {

@@ -218,6 +218,17 @@ pub struct AgentRun {
     /// PRs in Review forever.
     #[serde(default)]
     pub ci_status_fetch_failure_count: u32,
+    /// Signature of the trigger set used to spawn the most recent fix-run on
+    /// this Review run. Used by the stuck-loop escape: if two consecutive
+    /// fix-runs are about to fire with identical signatures, the agent is
+    /// going in circles and the run transitions to `AwaitingApproval` instead.
+    #[serde(default)]
+    pub last_trigger_signature: Option<String>,
+    /// Short, human-readable label describing the trigger that spawned the
+    /// most recent fix-run on this Review run (e.g. "Codex feedback",
+    /// "CI failure: build", "Conflict"). Surfaced in the dashboard Review card.
+    #[serde(default)]
+    pub last_trigger_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -247,6 +258,17 @@ pub struct RunSummary {
     pub pending_next_stage: Option<String>,
     #[serde(default)]
     pub review_iteration: u32,
+    /// Cumulative cost (USD) summed across every run for the same
+    /// (repo, issue) — surfaced on the dashboard Review card so operators can
+    /// see how close the run is to the cost cap.
+    #[serde(default)]
+    pub issue_cost_usd: f64,
+    /// Short summary of the trigger that fired the most recent fix-run on
+    /// this run (e.g. "Codex feedback", "CI failure: build", "Conflict").
+    /// Surfaced on the Review card so operators see the latest trigger
+    /// without opening the logs.
+    #[serde(default)]
+    pub last_trigger_summary: Option<String>,
 }
 
 impl From<&AgentRun> for RunSummary {
@@ -273,6 +295,10 @@ impl From<&AgentRun> for RunSummary {
             skipped_stages: run.skipped_stages.clone(),
             pending_next_stage: run.pending_next_stage.clone(),
             review_iteration: run.review_iteration,
+            // Default; `build_overview` recomputes this as a sum across every
+            // run for the same (repo, issue) using `cumulative_cost_for_issue`.
+            issue_cost_usd: 0.0,
+            last_trigger_summary: run.last_trigger_summary.clone(),
         }
     }
 }
@@ -370,6 +396,18 @@ pub struct RunConfig {
     /// Example: `aider --yes-always {{prompt}}`
     #[serde(default)]
     pub custom_agent_command: String,
+    /// Hard cap on review-loop fix-run iterations per Review run. When the
+    /// `review_iteration` counter reaches this value the next fix-run trigger
+    /// transitions the run to `AwaitingApproval` instead of spawning another
+    /// agent. Default 10. Set to 0 to disable the cap.
+    #[serde(default = "default_max_review_iterations")]
+    pub max_review_iterations: u32,
+    /// Cumulative cost cap (USD) summed across every run for the same
+    /// (repo, issue). When exceeded, the next fix-run trigger transitions the
+    /// Review run to `AwaitingApproval` instead of spawning another agent.
+    /// Default $5.00. Set to 0.0 to disable the cap.
+    #[serde(default = "default_cost_cap_per_issue_usd")]
+    pub cost_cap_per_issue_usd: f64,
 }
 
 fn default_priority_labels() -> Vec<String> {
@@ -398,6 +436,14 @@ fn default_codex_approve_patterns() -> Vec<String> {
 
 fn default_codex_feedback_marker() -> String {
     "Useful? React with 👍 / 👎.".to_string()
+}
+
+fn default_max_review_iterations() -> u32 {
+    10
+}
+
+fn default_cost_cap_per_issue_usd() -> f64 {
+    5.0
 }
 
 fn default_retry_base_delay() -> u64 {
@@ -436,6 +482,8 @@ impl Default for RunConfig {
             codex_feedback_marker: default_codex_feedback_marker(),
             local_repos: HashMap::new(),
             custom_agent_command: String::new(),
+            max_review_iterations: default_max_review_iterations(),
+            cost_cap_per_issue_usd: default_cost_cap_per_issue_usd(),
         }
     }
 }
@@ -456,6 +504,18 @@ pub struct OrchestratorOverview {
     pub total_runtime_secs: f64,
 }
 
+/// Sum `cost_usd` across every run for the given (repo, issue). Used both by
+/// the review-loop cost-cap check and by `build_overview` so the dashboard
+/// shows the same number the cap is measured against.
+pub fn cumulative_cost_for_issue(state: &OrchestratorState, repo: &str, issue_number: u64) -> f64 {
+    state
+        .runs
+        .values()
+        .filter(|run| run.repo == repo && run.issue_number == issue_number)
+        .map(|run| run.cost_usd)
+        .sum()
+}
+
 fn build_overview(state: &OrchestratorState) -> OrchestratorOverview {
     let mut runs = Vec::with_capacity(state.runs.len());
     let mut total_completed = 0;
@@ -473,7 +533,9 @@ fn build_overview(state: &OrchestratorState) -> OrchestratorOverview {
             active_count += 1;
         }
 
-        runs.push(RunSummary::from(run));
+        let mut summary = RunSummary::from(run);
+        summary.issue_cost_usd = cumulative_cost_for_issue(state, &run.repo, run.issue_number);
+        runs.push(summary);
     }
 
     OrchestratorOverview {
@@ -973,6 +1035,8 @@ mod tests {
             review_iteration: 0,
             last_ci_failure_sha: None,
             ci_status_fetch_failure_count: 0,
+            last_trigger_signature: None,
+            last_trigger_summary: None,
         }
     }
 
@@ -1073,6 +1137,8 @@ mod tests {
             review_iteration: 0,
             last_ci_failure_sha: None,
             ci_status_fetch_failure_count: 0,
+            last_trigger_signature: None,
+            last_trigger_summary: None,
         }
     }
 

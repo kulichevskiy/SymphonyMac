@@ -97,6 +97,87 @@ pub mod pipeline_helpers {
         .await;
     }
 
+    /// Update the trigger signature + human-readable summary of the most
+    /// recent fix-run dispatched on this Review run. Persisted so the
+    /// signature dedup survives across orchestrator polls and process
+    /// restarts.
+    pub async fn set_last_trigger(
+        state: &SharedState,
+        run_id: &str,
+        signature: Option<String>,
+        summary: Option<String>,
+    ) {
+        let _ = runtime::mutate_run(state, run_id, true, move |run| {
+            run.last_trigger_signature = signature;
+            run.last_trigger_summary = summary;
+        })
+        .await;
+    }
+
+    /// Park a Review run in `AwaitingApproval` with `pending_next_stage =
+    /// "merge"` because one of the stuck-loop escape limits fired. Logs the
+    /// human reason, fires a notification, and refreshes the dock badge.
+    pub async fn escape_review_run_to_awaiting_approval(
+        app: &AppHandle,
+        state: &SharedState,
+        run_id: &str,
+        reason: String,
+    ) {
+        use crate::orchestrator::{AgentStatus, PipelineStage};
+        let mut emit_extra = serde_json::Map::new();
+        emit_extra.insert(
+            "pending_next_stage".to_string(),
+            serde_json::json!(PipelineStage::Merge.to_string()),
+        );
+        emit_extra.insert(
+            "escape_reason".to_string(),
+            serde_json::json!(reason.clone()),
+        );
+
+        let log_message = format!(
+            "[review] Stuck-loop escape: {}. Parking run as AwaitingApproval (pending_next_stage=merge).",
+            reason
+        );
+
+        let _ = runtime::transition_run(
+            app,
+            state,
+            run_id,
+            runtime::StatusTransition {
+                status: AgentStatus::AwaitingApproval,
+                stage_label: PipelineStage::Review.to_string(),
+                error: None,
+                finished: false,
+                log_message: Some(log_message),
+                pending_next_stage: runtime::PendingNextStageUpdate::Set(
+                    PipelineStage::Merge.to_string(),
+                ),
+                emit_extra,
+                persist_meta: true,
+            },
+        )
+        .await;
+
+        let (issue_number, notifications_enabled, notification_sound) = {
+            let s = state.lock().await;
+            let issue_number = s.runs.get(run_id).map(|r| r.issue_number).unwrap_or(0);
+            (
+                issue_number,
+                s.config.notifications_enabled,
+                s.config.notification_sound,
+            )
+        };
+        if notifications_enabled {
+            crate::notification::notify_review_escape(
+                app,
+                issue_number,
+                &reason,
+                notification_sound,
+            );
+        }
+        runtime::update_dock_badge(state).await;
+    }
+
     /// Synchronously transition the Review run from `Running` (polling
     /// sentinel) to `Preparing` (fix-run is being dispatched). Must be awaited
     /// *before* `tokio::spawn` is called for the fix-run, so the next poll tick

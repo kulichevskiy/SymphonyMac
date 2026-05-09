@@ -9,6 +9,7 @@ import {
   OrchestratorSection,
   PriorityLabelsSection,
   PromptTemplatesSection,
+  ReviewLoopLimitsSection,
   SettingsSaveBar,
   WorkspaceCleanupSection,
 } from "./SettingsSections";
@@ -104,6 +105,7 @@ export function SettingsView({
             {activeTab === "pipeline" && (
               <>
                 <OrchestratorSection config={config} setConfig={setConfig} />
+                <ReviewLoopLimitsSection config={config} setConfig={setConfig} />
                 <PriorityLabelsSection config={config} setConfig={setConfig} />
                 <ApprovalGatesSection config={config} setConfig={setConfig} />
               </>

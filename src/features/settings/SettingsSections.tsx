@@ -393,6 +393,70 @@ export function OrchestratorSection({
   );
 }
 
+export function ReviewLoopLimitsSection({
+  config,
+  setConfig,
+}: {
+  config: RunConfig;
+  setConfig: ConfigSetter;
+}) {
+  return (
+    <SectionCard
+      title="Review Loop Limits"
+      icon="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+      description={
+        <>
+          Stuck-loop escape — when a Review run hits one of these limits, it parks as
+          <span className="font-mono mx-1">AwaitingApproval</span> with the next stage set to
+          <span className="font-mono mx-1">merge</span>, so you can force-advance, stop, or intervene.
+        </>
+      }
+    >
+      <div className="space-y-5">
+        <div className="grid grid-cols-2 gap-4">
+          <NumberField
+            label="Max Review Iterations"
+            value={config.max_review_iterations}
+            min={0}
+            max={100}
+            onChange={(v) =>
+              setConfig((c) => ({ ...c, max_review_iterations: v || 0 }))
+            }
+            help="Hard cap on fix-runs per Review (0 = disabled)"
+          />
+          <div>
+            <label className="block text-sm text-[#8b949e] mb-1.5">
+              Cost Cap per Issue
+            </label>
+            <div className="relative">
+              <input
+                type="number"
+                min={0}
+                step="0.01"
+                value={config.cost_cap_per_issue_usd}
+                onChange={(event) => {
+                  const parsed = parseFloat(event.target.value);
+                  setConfig((c) => ({
+                    ...c,
+                    cost_cap_per_issue_usd: Number.isFinite(parsed) ? parsed : 0,
+                  }));
+                }}
+                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-[#e6edf3] text-sm outline-none focus:border-[#58a6ff] focus:ring-1 focus:ring-[#58a6ff33] transition-colors"
+              />
+              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-[#484f58]">
+                USD
+              </span>
+            </div>
+            <p className="text-xs text-[#484f58] mt-1.5">
+              Total agent spend per (repo, issue) before escape (0 = disabled)
+            </p>
+          </div>
+        </div>
+      </div>
+    </SectionCard>
+  );
+}
+
 export function PriorityLabelsSection({
   config,
   setConfig,

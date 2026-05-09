@@ -345,6 +345,8 @@ async fn register_review_run(
         review_iteration: 0,
         last_ci_failure_sha: None,
         ci_status_fetch_failure_count: 0,
+        last_trigger_signature: None,
+        last_trigger_summary: None,
     };
     super::runtime::register_preparing_run(app, state, run, Map::new()).await;
     run_id
@@ -1003,6 +1005,8 @@ fn prepare_stage_run(config: &RunConfig, spec: StageLaunchSpec) -> PreparedStage
         review_iteration: 0,
         last_ci_failure_sha: None,
         ci_status_fetch_failure_count: 0,
+        last_trigger_signature: None,
+        last_trigger_summary: None,
     };
 
     let request = AgentProcessRequest {
@@ -1214,6 +1218,8 @@ fn build_done_run(
         review_iteration: 0,
         last_ci_failure_sha: None,
         ci_status_fetch_failure_count: 0,
+        last_trigger_signature: None,
+        last_trigger_summary: None,
     };
 
     (done_run, pipeline_report)
@@ -1380,6 +1386,8 @@ mod tests {
             review_iteration: 0,
             last_ci_failure_sha: None,
             ci_status_fetch_failure_count: 0,
+            last_trigger_signature: None,
+            last_trigger_summary: None,
         }
     }
 
@@ -1659,6 +1667,8 @@ mod tests {
             review_iteration: 0,
             last_ci_failure_sha: None,
             ci_status_fetch_failure_count: 0,
+            last_trigger_signature: None,
+            last_trigger_summary: None,
         };
 
         let context = extract_stage_context(&run, "pedrocid/SymphonyMac");
