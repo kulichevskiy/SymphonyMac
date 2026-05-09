@@ -244,10 +244,11 @@ pub(crate) async fn run_agent_process(
             if timed_out {
                 let is_running = {
                     let s = stall_state.lock().await;
-                    s.runs
-                        .get(&stall_run_id)
-                        .map(|run| run.status == AgentStatus::Running)
-                        .unwrap_or(false)
+                    // Same PID-based liveness check as the post-notify branch
+                    // below: fix-runs sit in `Preparing` for the entire
+                    // subprocess lifetime, so a status-only check would let a
+                    // stalled fix-run hang the Review run forever.
+                    s.agent_pids.contains_key(&stall_run_id)
                 };
 
                 if !is_running {
