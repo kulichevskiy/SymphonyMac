@@ -134,9 +134,22 @@ async fn check_codex_activity(
     }
 
     // 2. No approval — look for actionable feedback comments and spawn a fix-run.
+    //
+    // Refuse to fix-run when we don't have a `last_review_request_at` baseline
+    // (legacy persisted Review runs, or a run observed before its first
+    // `@codex review` post wrote the field). Without a baseline,
+    // `collect_codex_feedback` would treat *every* historical Codex comment as
+    // new and could force-push fixes for stale feedback that's already been
+    // addressed in a prior cycle. Approval doesn't have this hazard (an
+    // outdated approval is gated by the `head_sha_matches` check), so we only
+    // bail out of the feedback path here.
+    let Some(baseline_ts) = snapshot.last_review_request_at.as_deref() else {
+        return;
+    };
+
     let feedback_comments = collect_codex_feedback(
         &pr_state.comments,
-        snapshot.last_review_request_at.as_deref(),
+        Some(baseline_ts),
         approve_patterns,
         feedback_marker,
     );
@@ -550,6 +563,35 @@ mod tests {
 
         // Empty marker — we never trigger fix-runs (defensive).
         assert!(!comment_is_feedback(body, &approve_patterns(), ""));
+    }
+
+    #[test]
+    fn collect_codex_feedback_with_no_baseline_treats_all_history_as_new() {
+        // Documents the hazard the missing-baseline guard in `check_codex_activity`
+        // protects against: without a baseline timestamp, every historical Codex
+        // feedback comment is "new". The orchestrator-level guard refuses to
+        // spawn a fix-run when `last_review_request_at` is None precisely so
+        // this set isn't acted on against a stale review cycle.
+        let comments = vec![
+            comment(
+                "chatgpt-codex-connector[bot]",
+                "2025-01-01T00:00:00Z",
+                "Old feedback from prior cycle.\n\nUseful? React with 👍 / 👎.",
+            ),
+            comment(
+                "chatgpt-codex-connector[bot]",
+                "2025-06-01T00:00:00Z",
+                "Other old feedback.\n\nUseful? React with 👍 / 👎.",
+            ),
+        ];
+
+        let with_no_baseline =
+            collect_codex_feedback(&comments, None, &approve_patterns(), marker());
+        assert_eq!(
+            with_no_baseline.len(),
+            2,
+            "without a baseline, every historical Codex feedback comment looks new"
+        );
     }
 
     #[test]
