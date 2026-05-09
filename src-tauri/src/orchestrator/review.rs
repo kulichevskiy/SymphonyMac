@@ -17,7 +17,7 @@ struct ReviewRunSnapshot {
 }
 
 pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
-    let (snapshots, approve_patterns) = {
+    let (snapshots, approve_patterns, feedback_marker) = {
         let s = state.lock().await;
         let snapshots: Vec<ReviewRunSnapshot> = s
             .runs
@@ -36,11 +36,15 @@ pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
                 last_review_request_at: run.last_review_request_at.clone(),
             })
             .collect();
-        (snapshots, s.config.codex_approve_patterns.clone())
+        (
+            snapshots,
+            s.config.codex_approve_patterns.clone(),
+            s.config.codex_feedback_marker.clone(),
+        )
     };
 
     for snapshot in snapshots {
-        check_codex_approval(app, state, snapshot, &approve_patterns).await;
+        check_codex_approval(app, state, snapshot, &approve_patterns, &feedback_marker).await;
     }
 }
 
@@ -49,6 +53,7 @@ async fn check_codex_approval(
     state: &SharedState,
     snapshot: ReviewRunSnapshot,
     approve_patterns: &[String],
+    feedback_marker: &str,
 ) {
     let pr_state = match github::pr_full_state(&snapshot.repo, snapshot.issue_number).await {
         Ok(Some(pr)) => pr,
@@ -67,7 +72,7 @@ async fn check_codex_approval(
     let approved_comment = pr_state.comments.iter().find(|comment| {
         is_codex_author(&comment.author)
             && newer_than(&comment.created_at, snapshot.last_review_request_at.as_deref())
-            && github::parse_codex_approval(&comment.body, approve_patterns)
+            && github::parse_codex_approval(&comment.body, approve_patterns, feedback_marker)
     });
 
     let Some(comment) = approved_comment else {

@@ -365,10 +365,13 @@ fn default_stall_timeout() -> u64 {
 }
 
 fn default_codex_approve_patterns() -> Vec<String> {
+    // Note: do NOT include a bare `👍` here. Codex appends a feedback footer to every
+    // review comment that contains 👍 ("Useful? React with 👍 / 👎."), so a 👍 substring
+    // would falsely flag any non-approving comment as approval. The orchestrator strips
+    // `codex_feedback_marker` before pattern matching to avoid that footer collision.
     vec![
         "Didn't find any major issues".to_string(),
         "did not find major issues".to_string(),
-        "👍".to_string(),
     ]
 }
 

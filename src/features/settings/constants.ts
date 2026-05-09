@@ -39,7 +39,6 @@ export const DEFAULT_RUN_CONFIG: RunConfig = {
   codex_approve_patterns: [
     "Didn't find any major issues",
     "did not find major issues",
-    "👍",
   ],
   codex_feedback_marker: "Useful? React with 👍 / 👎.",
   local_repos: {},

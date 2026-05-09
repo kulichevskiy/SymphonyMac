@@ -618,14 +618,26 @@ pub async fn post_codex_review(repo: &str, pr_number: u64) -> Result<(), String>
 
 /// Returns true if `text` matches any of the configured Codex approval `patterns`
 /// (case-insensitive substring match).
-pub fn parse_codex_approval(text: &str, patterns: &[String]) -> bool {
+///
+/// `feedback_marker` is the trailing footer Codex appends to its review comments
+/// (e.g. "Useful? React with 👍 / 👎."). It is stripped from `text` before matching,
+/// so emoji or phrases inside the footer cannot cause false-positive approvals.
+pub fn parse_codex_approval(text: &str, patterns: &[String], feedback_marker: &str) -> bool {
     if text.is_empty() || patterns.is_empty() {
         return false;
     }
-    let lower = text.to_lowercase();
+    let stripped = strip_feedback_marker(text, feedback_marker);
+    let lower = stripped.to_lowercase();
     patterns
         .iter()
         .any(|pattern| !pattern.is_empty() && lower.contains(&pattern.to_lowercase()))
+}
+
+fn strip_feedback_marker<'a>(text: &'a str, feedback_marker: &str) -> std::borrow::Cow<'a, str> {
+    if feedback_marker.is_empty() || !text.contains(feedback_marker) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(text.replace(feedback_marker, ""))
 }
 
 #[tauri::command]
@@ -773,35 +785,54 @@ mod tests {
         let patterns = vec![
             "Didn't find any major issues".to_string(),
             "did not find major issues".to_string(),
-            "👍".to_string(),
         ];
+        let marker = "Useful? React with 👍 / 👎.";
 
         // exact match (case-insensitive)
         assert!(parse_codex_approval(
             "DIDN'T FIND ANY MAJOR ISSUES — looks good to me.",
             &patterns,
+            marker,
         ));
 
         // alt phrasing
         assert!(parse_codex_approval(
             "After review, did NOT find major issues.",
             &patterns,
-        ));
-
-        // emoji marker
-        assert!(parse_codex_approval(
-            "LGTM 👍 from Codex",
-            &patterns,
+            marker,
         ));
 
         // no match
         assert!(!parse_codex_approval(
             "Found a couple of issues that need fixing.",
             &patterns,
+            marker,
         ));
 
         // empty inputs
-        assert!(!parse_codex_approval("", &patterns));
-        assert!(!parse_codex_approval("anything", &[]));
+        assert!(!parse_codex_approval("", &patterns, marker));
+        assert!(!parse_codex_approval("anything", &[], marker));
+    }
+
+    #[test]
+    fn test_parse_codex_approval_ignores_feedback_marker_footer() {
+        // A non-approving Codex comment with the footer (which contains 👍) should NOT match
+        // even if the patterns list contains a bare 👍 — the footer is stripped first.
+        let patterns = vec![
+            "Didn't find any major issues".to_string(),
+            "👍".to_string(),
+        ];
+        let marker = "Useful? React with 👍 / 👎.";
+
+        let non_approving_with_footer = "Found a P1 bug; please fix.\n\nUseful? React with 👍 / 👎.";
+        assert!(
+            !parse_codex_approval(non_approving_with_footer, &patterns, marker),
+            "footer-only 👍 must not be treated as approval"
+        );
+
+        // Real approval phrase still matches even with the footer.
+        let approving_with_footer =
+            "Didn't find any major issues.\n\nUseful? React with 👍 / 👎.";
+        assert!(parse_codex_approval(approving_with_footer, &patterns, marker));
     }
 }

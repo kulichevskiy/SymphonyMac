@@ -32,11 +32,12 @@ last_log_timestamp: string | null,
  */
 input_tokens: bigint, output_tokens: bigint, cost_usd: number, 
 /**
- * Labels from the GitHub issue, used for stage-skip logic
+ * Labels from the GitHub issue (informational; retained for future label-based features).
  */
 issue_labels: Array<string>, 
 /**
- * Stages that were skipped for this issue based on label rules
+ * Stages that were skipped for this issue. Always empty in the new 3-stage pipeline;
+ * preserved on the contract for backward compatibility with persisted runs.
  */
 skipped_stages: Array<string>, 
 /**

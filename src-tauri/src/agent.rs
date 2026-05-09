@@ -39,17 +39,66 @@ pub struct ReviewAdvanceContext {
     pub workspace_path: String,
 }
 
-/// Mark a Review-stage run as Completed and spawn the Merge stage.
+/// Mark a Review-stage run as Completed and spawn the Merge stage —
+/// unless `approval_gates["review"]` is enabled, in which case the run is
+/// paused as `AwaitingApproval` so the user can advance to Merge manually.
 /// Called by the orchestrator's review-poll loop when Codex approval is detected.
 pub async fn advance_review_to_merge(
     app: &AppHandle,
     state: &SharedState,
     ctx: ReviewAdvanceContext,
 ) {
-    let previous_context = {
+    let (previous_context, gate_enabled, max_retries) = {
         let s = state.lock().await;
-        s.runs.get(&ctx.run_id).and_then(|run| run.stage_context.clone())
+        let context = s
+            .runs
+            .get(&ctx.run_id)
+            .and_then(|run| run.stage_context.clone());
+        let gate = crate::orchestrator::is_gate_enabled(&s.config, &PipelineStage::Review);
+        (context, gate, s.config.max_retries)
     };
+
+    if gate_enabled {
+        let mut emit_extra = Map::new();
+        emit_extra.insert(
+            "pending_next_stage".to_string(),
+            json!(PipelineStage::Merge.to_string()),
+        );
+        let _ = runtime::transition_run(
+            app,
+            state,
+            &ctx.run_id,
+            StatusTransition {
+                status: AgentStatus::AwaitingApproval,
+                stage_label: PipelineStage::Review.to_string(),
+                error: None,
+                finished: false,
+                log_message: Some(
+                    "[review] Codex approved, but review approval gate is enabled — awaiting user approval to advance to Merge."
+                        .to_string(),
+                ),
+                pending_next_stage: PendingNextStageUpdate::Set(PipelineStage::Merge.to_string()),
+                emit_extra,
+                persist_meta: true,
+            },
+        )
+        .await;
+
+        let config = {
+            let s = state.lock().await;
+            s.config.clone()
+        };
+        if config.notifications_enabled {
+            crate::notification::notify_awaiting_approval(
+                app,
+                ctx.issue_number,
+                &PipelineStage::Review.to_string(),
+                config.notification_sound,
+            );
+        }
+        runtime::update_dock_badge(state).await;
+        return;
+    }
 
     let _ = runtime::transition_run(
         app,
@@ -67,11 +116,6 @@ pub async fn advance_review_to_merge(
         },
     )
     .await;
-
-    let max_retries = {
-        let s = state.lock().await;
-        s.config.max_retries
-    };
 
     spawn_next_stage(
         app.clone(),
@@ -653,7 +697,9 @@ pub async fn advance_to_stage(
 fn parse_stage(stage_name: &str, allow_done: bool) -> Result<PipelineStage, String> {
     match stage_name {
         "implement" => Ok(PipelineStage::Implement),
-        "review" => Ok(PipelineStage::Review),
+        // Accept legacy `code_review` / `testing` so persisted AwaitingApproval runs from
+        // pre-migration versions can still be approved (they map to the new Review stage).
+        "review" | "code_review" | "testing" => Ok(PipelineStage::Review),
         "merge" => Ok(PipelineStage::Merge),
         "done" if allow_done => Ok(PipelineStage::Done),
         _ => Err(format!("Invalid stage: {}", stage_name)),
