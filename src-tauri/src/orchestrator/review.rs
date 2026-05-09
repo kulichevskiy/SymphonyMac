@@ -106,6 +106,16 @@ async fn check_codex_activity(
         }
     };
 
+    // 0. DIRTY-state takes priority over both approval and feedback — a PR with
+    // hard conflicts cannot be merged, and applying Codex feedback on top of an
+    // unmergeable branch would only churn. Resolve the rebase first; the fix-run
+    // re-requests review on the rebased SHA, so an existing approval (now stale
+    // because HEAD changed) will be re-issued by Codex against the new state.
+    if github::pr_is_dirty(pr_state.merge_state_status.as_deref()) {
+        try_dispatch_rebase_fix_run(app, state, &snapshot, &pr_state).await;
+        return;
+    }
+
     // 1. Approval takes priority — if Codex says LGTM, advance to Merge regardless of
     // whether earlier comments were feedback.
     if let Some(comment) = find_codex_approval(
@@ -278,7 +288,114 @@ async fn check_codex_activity(
             previous_context: snapshot.stage_context,
             pr_number,
             branch_name,
-            feedback: feedback_text,
+            payload: crate::agent::pipeline_helpers::FixRunPayload::Feedback {
+                feedback: feedback_text,
+            },
+        },
+    );
+}
+
+/// Attempt to spawn a rebase fix-run when GitHub reports the PR as DIRTY.
+/// Honors the same external-push and double-spawn guards as the feedback
+/// path. Logs (but does not error) when a guard refuses the dispatch — the
+/// next poll tick will retry.
+async fn try_dispatch_rebase_fix_run(
+    app: &AppHandle,
+    state: &SharedState,
+    snapshot: &ReviewRunSnapshot,
+    pr_state: &github::PullRequestFullState,
+) {
+    // External-push guard: if HEAD moved since the last review request, a
+    // human (or some other process) pushed to this branch. `git push
+    // --force-with-lease` would already fail safely, but spawning a rebase
+    // agent against an externally-rewritten branch is wasted work and can
+    // confuse the operator.
+    if !head_sha_matches(snapshot.last_pushed_sha.as_deref(), pr_state.head_ref_oid.as_deref()) {
+        crate::agent::runtime_helpers::append_log(
+            state,
+            &snapshot.run_id,
+            format!(
+                "[review] PR is DIRTY but PR HEAD ({}) differs from last reviewed SHA ({}). Skipping rebase fix-run — external push detected.",
+                pr_state.head_ref_oid.as_deref().unwrap_or("unknown"),
+                snapshot.last_pushed_sha.as_deref().unwrap_or("unknown"),
+            ),
+        )
+        .await;
+        return;
+    }
+
+    let already_active = {
+        let s = state.lock().await;
+        s.runs.values().any(|run| {
+            another_review_active(
+                &run.repo,
+                run.issue_number,
+                &run.id,
+                &run.stage,
+                &run.status,
+                &snapshot.repo,
+                snapshot.issue_number,
+                &snapshot.run_id,
+            )
+        })
+    };
+    if already_active {
+        crate::agent::runtime_helpers::append_log(
+            state,
+            &snapshot.run_id,
+            "[review] PR is DIRTY but another Review run is already active for this issue — skipping rebase fix-run spawn this tick.".to_string(),
+        )
+        .await;
+        return;
+    }
+
+    let pr_number = pr_state.number;
+    let branch_name = pr_state.head_ref_name.clone();
+    let base_branch = pr_state
+        .base_ref_name
+        .clone()
+        .unwrap_or_else(|| "main".to_string());
+    let conflicting_files = pr_state.files.clone();
+    let next_iteration = snapshot.review_iteration.saturating_add(1);
+
+    let log_message = format!(
+        "[review] PR mergeStateStatus=DIRTY ({} file{} touched). Spawning rebase fix-run iteration {} against base `{}`.",
+        conflicting_files.len(),
+        if conflicting_files.len() == 1 { "" } else { "s" },
+        next_iteration,
+        base_branch,
+    );
+    let _ = crate::agent::runtime_helpers::append_log(state, &snapshot.run_id, log_message).await;
+    let _ = crate::agent::pipeline_helpers::set_review_iteration(
+        state,
+        &snapshot.run_id,
+        next_iteration,
+    )
+    .await;
+    crate::agent::pipeline_helpers::mark_review_run_dispatching_fix_run(
+        app,
+        state,
+        &snapshot.run_id,
+    )
+    .await;
+
+    crate::agent::pipeline_helpers::spawn_fix_run(
+        app,
+        state,
+        crate::agent::pipeline_helpers::FixRunSnapshot {
+            run_id: snapshot.run_id.clone(),
+            repo: snapshot.repo.clone(),
+            issue_number: snapshot.issue_number,
+            issue_title: snapshot.issue_title.clone(),
+            issue_labels: snapshot.issue_labels.clone(),
+            workspace_path: PathBuf::from(snapshot.workspace_path.clone()),
+            previous_context: snapshot.stage_context.clone(),
+            pr_number,
+            branch_name,
+            payload: crate::agent::pipeline_helpers::FixRunPayload::Rebase {
+                base_branch,
+                conflicting_files,
+            },
         },
     );
 }

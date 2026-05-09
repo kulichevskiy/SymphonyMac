@@ -61,7 +61,24 @@ pub struct PullRequestFullState {
     pub state: String,
     pub head_ref_name: String,
     pub head_ref_oid: Option<String>,
+    pub base_ref_name: Option<String>,
+    /// GraphQL `mergeStateStatus`. Common values include `CLEAN`, `DIRTY`,
+    /// `BLOCKED`, `BEHIND`, `UNKNOWN`, `UNSTABLE`, `HAS_HOOKS`. We only act on
+    /// `DIRTY` (PR has conflicts with base) — everything else is a soft signal
+    /// the Review loop ignores.
+    pub merge_state_status: Option<String>,
+    /// PR file paths (from `gh pr list --json files`). Used to seed the
+    /// rebase fix-run prompt with a "likely conflicting files" hint.
+    pub files: Vec<String>,
     pub comments: Vec<PrComment>,
+}
+
+/// Returns true when GitHub reports `mergeStateStatus == DIRTY` for this PR —
+/// the only state that indicates a hard merge conflict the rebase fix-run can
+/// act on. Other unmergeable states (`BLOCKED`, `BEHIND`, `UNKNOWN`, etc.) are
+/// not conflicts and should not trigger a rebase agent.
+pub fn pr_is_dirty(merge_state: Option<&str>) -> bool {
+    matches!(merge_state, Some(state) if state.eq_ignore_ascii_case("DIRTY"))
 }
 
 #[async_trait]
@@ -552,7 +569,7 @@ pub async fn pr_full_state(
     repo: &str,
     issue_number: u64,
 ) -> Result<Option<PullRequestFullState>, String> {
-    let json_fields = "number,title,body,state,headRefName,headRefOid,comments";
+    let json_fields = "number,title,body,state,headRefName,headRefOid,baseRefName,mergeStateStatus,files,comments";
     let output = run_gh(&[
         "pr",
         "list",
@@ -605,11 +622,24 @@ fn select_pr_full_state(
             })
             .unwrap_or_default();
 
+        let files = pr["files"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["path"].as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         return Some(PullRequestFullState {
             number: pr["number"].as_u64().unwrap_or(0),
             state: state.to_string(),
             head_ref_name: pr["headRefName"].as_str().unwrap_or("").to_string(),
             head_ref_oid: pr["headRefOid"].as_str().map(|s| s.to_string()),
+            base_ref_name: pr["baseRefName"].as_str().map(|s| s.to_string()),
+            merge_state_status: pr["mergeStateStatus"].as_str().map(|s| s.to_string()),
+            files,
             comments,
         });
     }
@@ -844,6 +874,9 @@ mod tests {
                 "state": "MERGED",
                 "headRefName": "old-branch",
                 "headRefOid": "old111",
+                "baseRefName": "main",
+                "mergeStateStatus": "CLEAN",
+                "files": [],
                 "comments": []
             },
             {
@@ -853,6 +886,9 @@ mod tests {
                 "state": "OPEN",
                 "headRefName": "new-branch",
                 "headRefOid": "new222",
+                "baseRefName": "main",
+                "mergeStateStatus": "CLEAN",
+                "files": [{"path": "src/foo.rs"}, {"path": "src/bar.rs"}],
                 "comments": []
             }
         ]);
@@ -862,6 +898,53 @@ mod tests {
         assert_eq!(selected.number, 200);
         assert_eq!(selected.state, "OPEN");
         assert_eq!(selected.head_ref_oid.as_deref(), Some("new222"));
+        assert_eq!(selected.base_ref_name.as_deref(), Some("main"));
+        assert_eq!(selected.merge_state_status.as_deref(), Some("CLEAN"));
+        assert_eq!(selected.files, vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_select_pr_full_state_extracts_dirty_merge_state() {
+        // The Review-loop DIRTY trigger relies on this field surfacing through
+        // pr_full_state. Without it, conflicting PRs would be invisible to the
+        // rebase fix-run dispatcher.
+        let prs = serde_json::json!([
+            {
+                "number": 200,
+                "title": "Fix #42",
+                "body": "Closes #42",
+                "state": "OPEN",
+                "headRefName": "feature",
+                "headRefOid": "abc",
+                "baseRefName": "main",
+                "mergeStateStatus": "DIRTY",
+                "files": [{"path": "src/lib.rs"}],
+                "comments": []
+            }
+        ]);
+        let prs_array = prs.as_array().unwrap();
+        let selected = select_pr_full_state(prs_array, 42).expect("PR present");
+        assert_eq!(selected.merge_state_status.as_deref(), Some("DIRTY"));
+        assert!(pr_is_dirty(selected.merge_state_status.as_deref()));
+    }
+
+    #[test]
+    fn test_pr_is_dirty_only_matches_dirty_case_insensitively() {
+        // We only act on DIRTY — the only mergeable status that means hard
+        // conflicts. BLOCKED/BEHIND/etc. are not conflicts and must NOT trigger
+        // a rebase fix-run, which would otherwise destroy work or churn forever.
+        assert!(pr_is_dirty(Some("DIRTY")));
+        assert!(pr_is_dirty(Some("dirty")));
+        assert!(pr_is_dirty(Some("Dirty")));
+
+        assert!(!pr_is_dirty(Some("CLEAN")));
+        assert!(!pr_is_dirty(Some("BLOCKED")));
+        assert!(!pr_is_dirty(Some("BEHIND")));
+        assert!(!pr_is_dirty(Some("UNKNOWN")));
+        assert!(!pr_is_dirty(Some("UNSTABLE")));
+        assert!(!pr_is_dirty(Some("HAS_HOOKS")));
+        assert!(!pr_is_dirty(Some("")));
+        assert!(!pr_is_dirty(None));
     }
 
     #[test]
@@ -874,6 +957,9 @@ mod tests {
                 "state": "MERGED",
                 "headRefName": "old-branch",
                 "headRefOid": "old111",
+                "baseRefName": "main",
+                "mergeStateStatus": "CLEAN",
+                "files": [],
                 "comments": []
             }
         ]);
