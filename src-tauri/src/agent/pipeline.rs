@@ -9,6 +9,20 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
+/// Distinguishes the two flavours of Review-stage fix-runs. Both reuse the
+/// polling Review run's id and run inside the existing PR worktree, but they
+/// differ in prompt, success treatment, and failure escape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FixRunKind {
+    /// Codex left actionable review feedback — apply it, push, re-request review.
+    Feedback,
+    /// `mergeStateStatus == DIRTY` — rebase onto base, push, re-request review.
+    /// On non-zero exit (or unmerged paths still present after the agent gives
+    /// up), the run escapes to AwaitingApproval with `pending_next_stage = "merge"`
+    /// instead of being marked Failed.
+    Rebase,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StageLaunchSpec {
     pub repo: String,
@@ -23,9 +37,13 @@ pub(crate) struct StageLaunchSpec {
     pub previous_error: String,
     pub previous_context: Option<StageContext>,
     /// True when this spec drives a Review-stage fix-run launched in response to
-    /// Codex feedback. Fix-runs reuse the Review polling run's id, skip the
-    /// red-gate, and on success re-post `@codex review` instead of advancing.
+    /// Codex feedback OR a DIRTY mergeStateStatus. Fix-runs reuse the Review
+    /// polling run's id, skip the red-gate, and on success re-post `@codex review`
+    /// instead of advancing.
     pub is_fix_run: bool,
+    /// Set when `is_fix_run == true` to indicate which fix-run variant is
+    /// running. None for non-fix-run specs.
+    pub fix_run_kind: Option<FixRunKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +370,29 @@ async fn resolve_pr_for_review(
     }
 }
 
+/// Per-kind payload for a fix-run spawn. `Feedback` carries the formatted
+/// Codex comments to forward to the agent; `Rebase` carries the conflict
+/// context the agent needs to know how to rebase.
+#[derive(Debug, Clone)]
+pub(crate) enum FixRunPayload {
+    Feedback {
+        feedback: String,
+    },
+    Rebase {
+        base_branch: String,
+        conflicting_files: Vec<String>,
+    },
+}
+
+impl FixRunPayload {
+    pub(crate) fn kind(&self) -> FixRunKind {
+        match self {
+            FixRunPayload::Feedback { .. } => FixRunKind::Feedback,
+            FixRunPayload::Rebase { .. } => FixRunKind::Rebase,
+        }
+    }
+}
+
 /// Snapshot of the Review run + its open PR captured under-lock for the
 /// fix-run dispatcher. Carries everything the spawn function needs without
 /// re-acquiring the state lock or re-querying GitHub.
@@ -366,7 +407,7 @@ pub(crate) struct FixRunSnapshot {
     pub previous_context: Option<StageContext>,
     pub pr_number: u64,
     pub branch_name: String,
-    pub feedback: String,
+    pub payload: FixRunPayload,
 }
 
 /// Spawn a Review-stage fix-run agent. The fix-run reuses the polling Review
@@ -384,23 +425,45 @@ pub(crate) fn spawn_fix_run(app: AppHandle, state: SharedState, snapshot: FixRun
             s.config.clone()
         };
 
-        let prompt = super::prompt::build_fix_run_prompt(
-            snapshot.issue_number,
-            &snapshot.repo,
-            &snapshot.issue_title,
-            snapshot.pr_number,
-            &snapshot.branch_name,
-            &snapshot.feedback,
-        );
+        let kind = snapshot.payload.kind();
+        let (prompt, activity) = match &snapshot.payload {
+            FixRunPayload::Feedback { feedback } => (
+                super::prompt::build_fix_run_prompt(
+                    snapshot.issue_number,
+                    &snapshot.repo,
+                    &snapshot.issue_title,
+                    snapshot.pr_number,
+                    &snapshot.branch_name,
+                    feedback,
+                ),
+                "Applying Codex feedback",
+            ),
+            FixRunPayload::Rebase {
+                base_branch,
+                conflicting_files,
+            } => (
+                super::prompt::build_rebase_fix_run_prompt(
+                    snapshot.issue_number,
+                    &snapshot.repo,
+                    &snapshot.issue_title,
+                    snapshot.pr_number,
+                    &snapshot.branch_name,
+                    base_branch,
+                    conflicting_files,
+                ),
+                "Rebasing onto base branch",
+            ),
+        };
         let (command, args) = build_command_args(&config, &prompt);
         let command_display = format_command_display(&command, &args);
 
         // Reflect the fix-run command + activity on the Review run so the UI
         // shows what's happening while the subprocess executes.
         let new_command_display = command_display.clone();
+        let activity_label = activity.to_string();
         let _ = super::runtime::mutate_run(&state, &snapshot.run_id, true, move |run| {
             run.command_display = Some(new_command_display);
-            run.activity = Some("Applying Codex feedback".to_string());
+            run.activity = Some(activity_label);
         })
         .await;
 
@@ -417,6 +480,7 @@ pub(crate) fn spawn_fix_run(app: AppHandle, state: SharedState, snapshot: FixRun
             previous_error: String::new(),
             previous_context: snapshot.previous_context.clone(),
             is_fix_run: true,
+            fix_run_kind: Some(kind),
         };
 
         let request = AgentProcessRequest {
@@ -499,6 +563,182 @@ pub(crate) async fn finalize_fix_run_success(
     .await;
 
     Ok(())
+}
+
+/// Classification of the worktree state after a rebase fix-run subprocess
+/// exits. Used to decide whether the rebase actually completed cleanly or
+/// the agent gave up partway through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RebaseOutcome {
+    /// `git status --porcelain` shows no unmerged paths and no rebase is in
+    /// progress. Safe to treat as a successful rebase.
+    Clean,
+    /// `git status --porcelain` reports lines starting with conflict markers
+    /// (`UU`, `AA`, `DD`, `AU`, `UA`, `DU`, `UD`). The rebase did not finish.
+    UnmergedPaths { paths: Vec<String> },
+    /// A rebase is still in progress (`.git/rebase-apply/` or
+    /// `.git/rebase-merge/` directory exists), or `git status` reports a
+    /// rebase-state header. The agent left the worktree mid-rebase.
+    RebaseInProgress,
+    /// `git status` itself failed — couldn't classify. Treated like a failed
+    /// rebase by the caller (escape to AwaitingApproval) so we don't push a
+    /// half-resolved branch by accident.
+    StatusFailed { error: String },
+}
+
+impl RebaseOutcome {
+    pub(crate) fn is_clean(&self) -> bool {
+        matches!(self, RebaseOutcome::Clean)
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            RebaseOutcome::Clean => "worktree clean, rebase complete".to_string(),
+            RebaseOutcome::UnmergedPaths { paths } => format!(
+                "unmerged paths remain after rebase: {}",
+                paths.join(", "),
+            ),
+            RebaseOutcome::RebaseInProgress => {
+                "rebase still in progress in worktree (.git/rebase-* present)".to_string()
+            }
+            RebaseOutcome::StatusFailed { error } => {
+                format!("could not run git status to verify rebase: {}", error)
+            }
+        }
+    }
+}
+
+/// Inspect the worktree post-rebase. Returns `Clean` only when there are no
+/// unmerged paths AND no in-progress rebase state. The orchestrator uses this
+/// to detect rebase failures the agent itself didn't surface (e.g. exited zero
+/// after `git rebase --abort` without saying so).
+pub(crate) async fn verify_rebase_outcome(workspace: &std::path::Path) -> RebaseOutcome {
+    if workspace.join(".git").join("rebase-apply").exists()
+        || workspace.join(".git").join("rebase-merge").exists()
+    {
+        return RebaseOutcome::RebaseInProgress;
+    }
+
+    let output = tokio::process::Command::new("git")
+        .args(["status", "--porcelain=v1"])
+        .current_dir(workspace)
+        .env("PATH", crate::paths::build_path_env())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await;
+
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return RebaseOutcome::StatusFailed {
+                error: error.to_string(),
+            };
+        }
+    };
+
+    if !output.status.success() {
+        return RebaseOutcome::StatusFailed {
+            error: format!(
+                "git status exited with code {}: {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            ),
+        };
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    classify_porcelain_status(&stdout)
+}
+
+/// Pure parser over `git status --porcelain=v1` output. Lines beginning with
+/// any unmerged code (`UU`, `AA`, `DD`, `AU`, `UA`, `DU`, `UD`) signal an
+/// unfinished merge/rebase. Extracted so the classification is unit-testable
+/// without a real git workspace.
+pub(crate) fn classify_porcelain_status(stdout: &str) -> RebaseOutcome {
+    const UNMERGED: &[&str] = &["UU", "AA", "DD", "AU", "UA", "DU", "UD"];
+
+    let mut unmerged_paths = Vec::new();
+    for line in stdout.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let code = &line[..2];
+        if UNMERGED.contains(&code) {
+            let path = line[3..].trim().to_string();
+            if !path.is_empty() {
+                unmerged_paths.push(path);
+            }
+        }
+    }
+
+    if unmerged_paths.is_empty() {
+        RebaseOutcome::Clean
+    } else {
+        RebaseOutcome::UnmergedPaths {
+            paths: unmerged_paths,
+        }
+    }
+}
+
+/// Called when a rebase fix-run cannot land — either the agent exited
+/// non-zero, or it exited zero but the worktree still has unmerged paths /
+/// an active rebase. Transitions the Review run to `AwaitingApproval` with
+/// `pending_next_stage = "merge"` so the operator can advance manually past
+/// the conflict (acceptance criterion: "Manual approve_pending_stage from UI
+/// advances to Merge despite known conflicts").
+pub(crate) async fn finalize_rebase_fix_run_failure(
+    app: &AppHandle,
+    state: &SharedState,
+    run_id: &str,
+    issue_number: u64,
+    reason: String,
+) {
+    let mut emit_extra = Map::new();
+    emit_extra.insert(
+        "pending_next_stage".to_string(),
+        json!(PipelineStage::Merge.to_string()),
+    );
+    emit_extra.insert("error".to_string(), json!(reason.clone()));
+
+    let log_message = format!(
+        "[review] Rebase fix-run could not resolve conflicts ({}) — pausing as AwaitingApproval so an operator can resolve manually before Merge.",
+        reason,
+    );
+
+    let _ = super::runtime::transition_run(
+        app,
+        state,
+        run_id,
+        super::runtime::StatusTransition {
+            status: AgentStatus::AwaitingApproval,
+            stage_label: PipelineStage::Review.to_string(),
+            error: Some(reason.clone()),
+            finished: false,
+            log_message: Some(log_message),
+            pending_next_stage: super::runtime::PendingNextStageUpdate::Set(
+                PipelineStage::Merge.to_string(),
+            ),
+            emit_extra,
+            persist_meta: true,
+        },
+    )
+    .await;
+
+    let (notifications_enabled, notification_sound) = {
+        let s = state.lock().await;
+        (s.config.notifications_enabled, s.config.notification_sound)
+    };
+    if notifications_enabled {
+        crate::notification::notify_awaiting_approval(
+            app,
+            issue_number,
+            &PipelineStage::Review.to_string(),
+            notification_sound,
+        );
+    }
+    super::runtime::update_dock_badge(state).await;
 }
 
 async fn fail_review_run(state: &SharedState, run_id: &str, error: String) {
@@ -994,9 +1234,9 @@ fn build_stage_summary(stage: &PipelineStage, logs: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_usage_totals, build_done_run, decide_failure_action,
+        aggregate_usage_totals, build_done_run, classify_porcelain_status, decide_failure_action,
         decide_successful_stage_action, FailureAction, MergeVerification, PipelineCompletionSpec,
-        SuccessfulStageAction, UsageTotals,
+        RebaseOutcome, SuccessfulStageAction, UsageTotals,
     };
     use crate::orchestrator::{AgentRun, AgentStatus, PipelineStage, RunConfig};
     use std::path::PathBuf;
@@ -1328,5 +1568,118 @@ mod tests {
         assert_eq!(context.pr_number, Some(91));
         assert_eq!(context.branch_name.as_deref(), Some("symphony/issue-62"));
         assert!(context.summary.contains("git commit"));
+    }
+
+    #[test]
+    fn classify_porcelain_status_treats_empty_output_as_clean() {
+        // Clean rebase: nothing to commit, no unmerged paths.
+        assert_eq!(classify_porcelain_status(""), RebaseOutcome::Clean);
+    }
+
+    #[test]
+    fn classify_porcelain_status_ignores_normal_change_codes() {
+        // Modified/added/deleted entries are not unmerged. After a successful
+        // rebase the worktree may have these (e.g. a file moved across stages),
+        // but they don't represent conflict markers.
+        let stdout = "\
+ M src/lib.rs\n\
+A  src/new.rs\n\
+?? untracked.txt\n\
+ D removed.rs\n\
+";
+        assert_eq!(classify_porcelain_status(stdout), RebaseOutcome::Clean);
+    }
+
+    #[test]
+    fn classify_porcelain_status_flags_every_unmerged_code() {
+        // Every git unmerged-state code must trigger the failure path. Missing
+        // any of these would let a half-resolved rebase look "clean" and we'd
+        // force-push conflict markers to the PR branch.
+        for code in ["UU", "AA", "DD", "AU", "UA", "DU", "UD"] {
+            let stdout = format!("{} src/conflict.rs\n", code);
+            match classify_porcelain_status(&stdout) {
+                RebaseOutcome::UnmergedPaths { paths } => {
+                    assert_eq!(paths, vec!["src/conflict.rs".to_string()], "code {}", code);
+                }
+                other => panic!("code {} should flag unmerged, got {:?}", code, other),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_porcelain_status_collects_all_unmerged_paths() {
+        // Multi-file conflicts: all unmerged paths appear in the failure
+        // describe() output so the operator sees the full conflict set.
+        let stdout = "\
+UU src/a.rs\n\
+ M src/clean.rs\n\
+AA src/b.rs\n\
+UD src/c.rs\n\
+";
+        match classify_porcelain_status(stdout) {
+            RebaseOutcome::UnmergedPaths { paths } => {
+                assert_eq!(
+                    paths,
+                    vec![
+                        "src/a.rs".to_string(),
+                        "src/b.rs".to_string(),
+                        "src/c.rs".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected UnmergedPaths, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fix_run_payload_kind_round_trips_to_correct_variant() {
+        // The dispatch in `spawn_fix_run` and the rebase-escape branches in
+        // `process.rs` both rely on `FixRunPayload::kind()` correctly mapping
+        // each payload to its FixRunKind. Locking this mapping in a test
+        // prevents accidental regressions where a new payload variant would
+        // silently fall through to the feedback path.
+        use super::{FixRunKind, FixRunPayload};
+        assert_eq!(
+            FixRunPayload::Feedback {
+                feedback: "x".into()
+            }
+            .kind(),
+            FixRunKind::Feedback,
+        );
+        assert_eq!(
+            FixRunPayload::Rebase {
+                base_branch: "main".into(),
+                conflicting_files: vec![],
+            }
+            .kind(),
+            FixRunKind::Rebase,
+        );
+    }
+
+    #[test]
+    fn rebase_outcome_describe_includes_paths_for_operator() {
+        // The describe() string is what `finalize_rebase_fix_run_failure`
+        // surfaces as the run's error message and AwaitingApproval log line.
+        // It must contain the conflicting file list — that's what the
+        // operator needs to act.
+        let outcome = RebaseOutcome::UnmergedPaths {
+            paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+        };
+        let described = outcome.describe();
+        assert!(described.contains("src/a.rs"));
+        assert!(described.contains("src/b.rs"));
+        assert!(!outcome.is_clean());
+
+        let in_progress = RebaseOutcome::RebaseInProgress;
+        assert!(in_progress.describe().contains("rebase"));
+        assert!(!in_progress.is_clean());
+
+        let status_failed = RebaseOutcome::StatusFailed {
+            error: "git: command not found".into(),
+        };
+        assert!(status_failed.describe().contains("git: command not found"));
+        assert!(!status_failed.is_clean());
+
+        assert!(RebaseOutcome::Clean.is_clean());
     }
 }

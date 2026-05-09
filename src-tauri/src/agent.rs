@@ -26,7 +26,7 @@ pub mod pipeline_helpers {
     use crate::SharedState;
     use tauri::AppHandle;
 
-    pub(crate) use super::pipeline::FixRunSnapshot;
+    pub(crate) use super::pipeline::{FixRunPayload, FixRunSnapshot};
 
     /// Spawn a Review-stage fix-run agent for the given snapshot.
     pub fn spawn_fix_run(app: &AppHandle, state: &SharedState, snapshot: FixRunSnapshot) {
@@ -196,6 +196,7 @@ pub async fn advance_review_to_merge(
             previous_error: String::new(),
             previous_context,
             is_fix_run: false,
+            fix_run_kind: None,
         },
     );
 }
@@ -246,6 +247,7 @@ pub async fn launch_agent(
         previous_error: String::new(),
         previous_context: None,
         is_fix_run: false,
+        fix_run_kind: None,
     };
 
     if matches!(stage, PipelineStage::Review) {
@@ -504,6 +506,7 @@ pub async fn approve_stage(
         previous_error: String::new(),
         previous_context,
         is_fix_run: false,
+        fix_run_kind: None,
     };
 
     if matches!(next_stage, PipelineStage::Review) {
@@ -750,6 +753,7 @@ pub async fn advance_to_stage(
         previous_error: String::new(),
         previous_context,
         is_fix_run: false,
+        fix_run_kind: None,
     };
 
     if matches!(effective_stage, PipelineStage::Review) {

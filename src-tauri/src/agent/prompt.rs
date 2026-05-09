@@ -166,6 +166,104 @@ pipeline marks this fix-run as failed instead of pretending to succeed."
     )
 }
 
+/// Build the prompt for a *rebase* fix-run — spawned when the Review-loop
+/// poller observes `mergeStateStatus == DIRTY` on the PR. The agent runs
+/// inside the existing PR worktree and must rebase onto the base branch,
+/// resolve conflicts, and force-push. On failure (cannot resolve), the agent
+/// must exit non-zero so the orchestrator can escape to AwaitingApproval.
+///
+/// `conflicting_files` is the PR file list (pre-rebase). It's a *hint* — the
+/// real conflict set won't be known until after `git pull --rebase` runs.
+pub(crate) fn build_rebase_fix_run_prompt(
+    issue_number: u64,
+    repo: &str,
+    issue_title: &str,
+    pr_number: u64,
+    branch_name: &str,
+    base_branch: &str,
+    conflicting_files: &[String],
+) -> String {
+    let files_hint = if conflicting_files.is_empty() {
+        String::from("(no file list available — `git pull --rebase` will surface the actual conflicts)")
+    } else {
+        let mut sorted = conflicting_files.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        sorted
+            .iter()
+            .map(|path| format!("- {}", path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "\
+You are resolving a merge conflict on Pull Request #{pr_number} in repository {repo}.
+
+Issue: #{issue_number} — {issue_title}
+Branch: {branch_name}
+Base branch: {base_branch}
+
+GitHub reports `mergeStateStatus == DIRTY` on this PR — it cannot be merged \
+because the branch has conflicts with `{base_branch}`. You are running INSIDE \
+the existing PR worktree. Do NOT clone, do NOT switch branches, do NOT touch \
+unrelated history.
+
+Files touched by this PR (likely conflict candidates — the actual conflict \
+set will only be known after the rebase starts):
+
+{files_hint}
+
+What to do — follow this protocol exactly:
+
+1. Confirm you are on the PR branch and the working tree is clean:
+     git status
+   If unmerged paths or staged changes exist before you start, run:
+     git rebase --abort
+   so the rebase begins from a clean state.
+
+2. Fetch and rebase onto the latest base:
+     git fetch origin {base_branch}
+     git pull --rebase origin {base_branch}
+
+3. If conflicts appear, resolve them in the smallest possible scope. Preserve \
+the intent of the PR commits — do NOT discard their changes wholesale to favor \
+the base branch. After resolving each file:
+     git add <files>
+     git rebase --continue
+
+4. After the rebase completes, run a quick sanity check that no unmerged \
+paths remain:
+     git status --porcelain
+   The output must be empty (or only show local untracked files). Conflict \
+markers `<<<<<<<`, `=======`, or `>>>>>>>` MUST be gone from every file you \
+edited.
+
+5. Force-push with lease so we don't clobber a concurrent push:
+     git push --force-with-lease
+
+ESCAPE HATCH — when to give up:
+
+If at any point you cannot make progress (semantic conflicts, base history \
+diverged badly, conflicts span files you don't understand), abort cleanly and \
+exit with a non-zero status:
+     git rebase --abort
+     exit 1
+The orchestrator will detect the failure and pause the run for human review. \
+Do NOT push a partial rebase, do NOT commit unresolved conflict markers, do \
+NOT amend or squash the PR's prior commits to hide the problem.
+
+Hard rules:
+- Do NOT create a new PR. Push to the existing branch.
+- Do NOT close or reopen the PR.
+- Do NOT comment on the PR yourself — the orchestrator handles re-requesting \
+a review after a successful rebase.
+- Do NOT run `gh pr merge` — merging is a later pipeline stage.
+- If you complete steps 1–5 with no errors, exit 0. If you cannot, abort the \
+rebase and exit non-zero — never push a half-resolved state."
+    )
+}
+
 /// Aggressive reinforcement prompt used when the red-gate failed on the prior
 /// Implement attempt. Re-states the contract in stronger terms and forces the
 /// agent to start the branch over.
@@ -619,5 +717,76 @@ mod tests {
             super::build_custom_command_args("aider --message \"{{prompt}}\"", "fix the bug");
         assert!(bin.contains("aider"));
         assert_eq!(args, vec!["--message", "fix the bug"]);
+    }
+
+    #[test]
+    fn rebase_fix_run_prompt_lists_conflict_candidates_and_base_branch() {
+        // The acceptance criterion calls for the prompt to "include the list of
+        // likely conflicting files". The agent uses this list as the starting
+        // point for its rebase + conflict resolution.
+        let prompt = super::build_rebase_fix_run_prompt(
+            42,
+            "kulichevskiy/SymphonyMac",
+            "Refactor scheduler",
+            123,
+            "claude/issue-42",
+            "main",
+            &["src/lib.rs".into(), "src/scheduler.rs".into()],
+        );
+        assert!(prompt.contains("Pull Request #123"));
+        assert!(prompt.contains("Issue: #42 — Refactor scheduler"));
+        assert!(prompt.contains("Branch: claude/issue-42"));
+        assert!(prompt.contains("Base branch: main"));
+        assert!(prompt.contains("- src/lib.rs"));
+        assert!(prompt.contains("- src/scheduler.rs"));
+        assert!(prompt.contains("git pull --rebase origin main"));
+        assert!(prompt.contains("git push --force-with-lease"));
+        // Escape hatch: prompt MUST tell the agent to abort + exit non-zero on
+        // failure, otherwise the orchestrator's exit-code-based detection won't
+        // fire.
+        assert!(prompt.contains("git rebase --abort"));
+        assert!(prompt.contains("exit 1"));
+    }
+
+    #[test]
+    fn rebase_fix_run_prompt_dedupes_and_sorts_files_for_stable_output() {
+        // Stable file listing: the agent's prompt should be deterministic
+        // regardless of the order GitHub returns files in. Duplicates would be
+        // a quality issue too (gh has been known to repeat paths).
+        let prompt = super::build_rebase_fix_run_prompt(
+            1,
+            "owner/repo",
+            "title",
+            10,
+            "branch",
+            "main",
+            &[
+                "src/b.rs".into(),
+                "src/a.rs".into(),
+                "src/b.rs".into(),
+            ],
+        );
+        let a_pos = prompt.find("- src/a.rs").expect("a present");
+        let b_pos = prompt.find("- src/b.rs").expect("b present");
+        assert!(a_pos < b_pos, "files should be sorted alphabetically");
+        assert_eq!(
+            prompt.matches("- src/b.rs").count(),
+            1,
+            "duplicate file paths should be removed"
+        );
+    }
+
+    #[test]
+    fn rebase_fix_run_prompt_handles_empty_file_list_gracefully() {
+        // When `gh pr list --json files` is empty (rare but possible for an
+        // outdated cache), the prompt should still be valid — it must say
+        // "no file list available" rather than rendering an empty bullet block
+        // that the agent would interpret as zero files needing attention.
+        let prompt =
+            super::build_rebase_fix_run_prompt(1, "owner/repo", "title", 10, "branch", "main", &[]);
+        assert!(prompt.contains("no file list available"));
+        // Still tells the agent to actually rebase — the empty list isn't a
+        // signal to skip.
+        assert!(prompt.contains("git pull --rebase origin main"));
     }
 }

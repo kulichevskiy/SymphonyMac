@@ -1,6 +1,6 @@
 use super::pipeline::{
-    self, AgentProcessRequest, FailureAction, MergeVerification, PipelineCompletionSpec,
-    StageLaunchSpec, SuccessfulStageAction,
+    self, AgentProcessRequest, FailureAction, FixRunKind, MergeVerification,
+    PipelineCompletionSpec, StageLaunchSpec, SuccessfulStageAction,
 };
 use super::prompt::RED_GATE_RETRY_MARKER;
 use super::red_gate::{self, RedGateOutcome};
@@ -325,6 +325,20 @@ pub(crate) async fn run_agent_process(
 
     if stalled {
         run_after_run_hook(&state, &request.run_id, &request.spec.workspace_path).await;
+        if request.spec.fix_run_kind == Some(FixRunKind::Rebase) {
+            // Rebase fix-runs that stall haven't produced a clean rebase. Escape
+            // to AwaitingApproval rather than Failed so an operator can resolve
+            // manually — same treatment as a non-zero exit.
+            pipeline::finalize_rebase_fix_run_failure(
+                &app,
+                &state,
+                &request.run_id,
+                request.spec.issue_number,
+                "rebase agent stalled (no output within stall timeout)".to_string(),
+            )
+            .await;
+            return;
+        }
         handle_failed_attempt(&app, &state, &request, &stage_label).await;
         return;
     }
@@ -337,7 +351,23 @@ pub(crate) async fn run_agent_process(
     }
 
     let mut emit_extra = Map::new();
-    if !succeeded {
+    let rebase_failed_exit_reason: Option<String> =
+        if !succeeded && request.spec.fix_run_kind == Some(FixRunKind::Rebase) {
+            // Rebase fix-runs that exit non-zero are treated as "agent gave up
+            // and asked us to escape" — skip the Failed transition and route
+            // through `finalize_rebase_fix_run_failure` after the after_run hook.
+            Some(match &exit_status {
+                Ok(status) => format!(
+                    "rebase agent exited non-zero (code {})",
+                    status.code().unwrap_or(-1),
+                ),
+                Err(error) => format!("rebase agent process error: {}", error),
+            })
+        } else {
+            None
+        };
+
+    if !succeeded && rebase_failed_exit_reason.is_none() {
         let error_message = match &exit_status {
             Ok(status) => format!("Agent exited with code: {}", status.code().unwrap_or(-1)),
             Err(error) => format!("Agent process error: {}", error),
@@ -398,6 +428,20 @@ pub(crate) async fn run_agent_process(
 
     run_after_run_hook(&state, &request.run_id, &request.spec.workspace_path).await;
 
+    if let Some(reason) = rebase_failed_exit_reason {
+        // Rebase fix-run exited non-zero — pause as AwaitingApproval (operator
+        // override path) instead of marking Failed.
+        pipeline::finalize_rebase_fix_run_failure(
+            &app,
+            &state,
+            &request.run_id,
+            request.spec.issue_number,
+            reason,
+        )
+        .await;
+        return;
+    }
+
     if !succeeded {
         // Fix-run failures share the same exhausted-failure handling as other
         // stages — `handle_failed_attempt` emits `notify_pipeline_failed` and
@@ -409,6 +453,28 @@ pub(crate) async fn run_agent_process(
     }
 
     if request.spec.is_fix_run {
+        if request.spec.fix_run_kind == Some(FixRunKind::Rebase) {
+            // Even on a clean exit, verify the worktree actually finished the
+            // rebase. The agent could have exited zero after `git rebase --abort`
+            // or while the rebase was still in progress — in either case we
+            // must not push, because `finalize_fix_run_success` would record a
+            // stale SHA as last_pushed_sha and re-request review on a state
+            // that doesn't match what's on the remote.
+            let outcome =
+                pipeline::verify_rebase_outcome(&request.spec.workspace_path).await;
+            if !outcome.is_clean() {
+                pipeline::finalize_rebase_fix_run_failure(
+                    &app,
+                    &state,
+                    &request.run_id,
+                    request.spec.issue_number,
+                    outcome.describe(),
+                )
+                .await;
+                return;
+            }
+        }
+
         if let Err(error) = pipeline::finalize_fix_run_success(
             &app,
             &state,
@@ -1001,6 +1067,7 @@ fn next_stage_spec(
         previous_error,
         previous_context,
         is_fix_run: false,
+        fix_run_kind: None,
     }
 }
 
