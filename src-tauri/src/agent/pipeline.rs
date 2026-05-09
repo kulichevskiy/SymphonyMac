@@ -612,11 +612,34 @@ impl RebaseOutcome {
 /// unmerged paths AND no in-progress rebase state. The orchestrator uses this
 /// to detect rebase failures the agent itself didn't surface (e.g. exited zero
 /// after `git rebase --abort` without saying so).
+///
+/// The rebase-state directory check goes through `git rev-parse --git-dir`
+/// rather than hardcoding `<workspace>/.git`. SymphonyMac runs the agent in a
+/// *linked git worktree* whenever `local_repos[repo]` is configured (see
+/// `workspace::ensure_workspace_worktree`), and in that mode the worktree's
+/// `.git` is a *file* pointing at the real gitdir — `<workspace>/.git/rebase-merge/`
+/// would never exist even with a rebase actively paused. Without `git rev-parse`
+/// we'd also miss the case where the agent ran `git add` on the conflict
+/// resolutions but never `git rebase --continue`: status would show only `M/A/D`
+/// codes (which `classify_porcelain_status` treats as clean), so the rebase-dir
+/// existence is the only remaining signal.
 pub(crate) async fn verify_rebase_outcome(workspace: &std::path::Path) -> RebaseOutcome {
-    if workspace.join(".git").join("rebase-apply").exists()
-        || workspace.join(".git").join("rebase-merge").exists()
-    {
-        return RebaseOutcome::RebaseInProgress;
+    match resolve_git_dir(workspace).await {
+        Ok(git_dir) => {
+            if git_dir.join("rebase-apply").exists() || git_dir.join("rebase-merge").exists() {
+                return RebaseOutcome::RebaseInProgress;
+            }
+        }
+        Err(error) => {
+            // We could not resolve the gitdir at all — treat the same as a
+            // failed `git status`. The caller (`finalize_rebase_fix_run_failure`
+            // path) escapes to AwaitingApproval, which is the conservative
+            // choice rather than racing into `finalize_fix_run_success` and
+            // re-requesting review on a worktree we don't understand.
+            return RebaseOutcome::StatusFailed {
+                error: format!("git rev-parse --git-dir failed: {}", error),
+            };
+        }
     }
 
     let output = tokio::process::Command::new("git")
@@ -650,6 +673,46 @@ pub(crate) async fn verify_rebase_outcome(workspace: &std::path::Path) -> Rebase
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     classify_porcelain_status(&stdout)
+}
+
+/// Run `git rev-parse --git-dir` in `workspace` and return the resolved path
+/// to the gitdir (absolute when git returns one, otherwise joined under the
+/// workspace). For linked worktrees this resolves to
+/// `<main-repo>/.git/worktrees/<name>`, which is where `rebase-apply` /
+/// `rebase-merge` actually live during a paused rebase.
+async fn resolve_git_dir(
+    workspace: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(workspace)
+        .env("PATH", crate::paths::build_path_env())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse exited with code {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Err("git rev-parse --git-dir returned empty output".to_string());
+    }
+
+    let path = std::path::PathBuf::from(&raw);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    })
 }
 
 /// Pure parser over `git status --porcelain=v1` output. Lines beginning with
@@ -1235,11 +1298,12 @@ fn build_stage_summary(stage: &PipelineStage, logs: &[String]) -> String {
 mod tests {
     use super::{
         aggregate_usage_totals, build_done_run, classify_porcelain_status, decide_failure_action,
-        decide_successful_stage_action, FailureAction, MergeVerification, PipelineCompletionSpec,
-        RebaseOutcome, SuccessfulStageAction, UsageTotals,
+        decide_successful_stage_action, resolve_git_dir, verify_rebase_outcome, FailureAction,
+        MergeVerification, PipelineCompletionSpec, RebaseOutcome, SuccessfulStageAction,
+        UsageTotals,
     };
     use crate::orchestrator::{AgentRun, AgentStatus, PipelineStage, RunConfig};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn sample_run(
         id: &str,
@@ -1654,6 +1718,153 @@ UD src/c.rs\n\
             .kind(),
             FixRunKind::Rebase,
         );
+    }
+
+    /// Run `git` with the given args inside `cwd`. Panics on non-zero exit.
+    /// Helper for the rebase-state integration tests below.
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "Symphony Test")
+            .env("GIT_AUTHOR_EMAIL", "symphony@example.com")
+            .env("GIT_COMMITTER_NAME", "Symphony Test")
+            .env("GIT_COMMITTER_EMAIL", "symphony@example.com")
+            .output()
+            .expect("git available on PATH for tests");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_git_dir_resolves_linked_worktree_gitdir_not_workspace_dotgit() {
+        // Regression test for the P1 Codex flagged on PR #10: SymphonyMac runs
+        // the agent in a *linked* git worktree when `local_repos[repo]` is set,
+        // and in that mode `<workspace>/.git` is a file pointing at the real
+        // gitdir under `<main-repo>/.git/worktrees/<name>/`. If
+        // `verify_rebase_outcome` checks `<workspace>/.git/rebase-*` directly
+        // (the bug), it will *never* fire on a paused rebase in a linked
+        // worktree, and we'd silently force-push a half-rebased branch.
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_repo = tmp.path().join("main");
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir(&main_repo).unwrap();
+
+        run_git(&main_repo, &["init", "--initial-branch=main"]);
+        // Need at least one commit before `git worktree add` will accept the
+        // current branch as a starting point.
+        std::fs::write(main_repo.join("seed.txt"), "seed\n").unwrap();
+        run_git(&main_repo, &["add", "seed.txt"]);
+        run_git(&main_repo, &["commit", "-m", "seed"]);
+        run_git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/issue-5",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        // Sanity: in a linked worktree, `.git` is a file (not a directory).
+        // If this changes the test premise is wrong.
+        let dot_git = linked.join(".git");
+        assert!(dot_git.exists());
+        assert!(
+            dot_git.is_file(),
+            ".git in a linked worktree should be a file pointing at the gitdir",
+        );
+        assert!(
+            !linked.join(".git").join("rebase-merge").exists(),
+            "the buggy path must not resolve to anything",
+        );
+
+        let git_dir = resolve_git_dir(&linked).await.expect("resolve_git_dir");
+        // The resolved gitdir for a linked worktree lives under the main
+        // repo's `.git/worktrees/<name>/`. This is where rebase-merge /
+        // rebase-apply actually appear during a paused rebase, and the
+        // verify_rebase_outcome check must look here.
+        let expected_suffix = std::path::Path::new(".git").join("worktrees").join("linked");
+        assert!(
+            git_dir.ends_with(&expected_suffix),
+            "git_dir was {:?}, expected to end with {:?}",
+            git_dir,
+            expected_suffix,
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_rebase_outcome_detects_paused_rebase_in_linked_worktree() {
+        // End-to-end: in a linked worktree, a `rebase-merge/` directory under
+        // the resolved gitdir (NOT under <workspace>/.git) must classify as
+        // RebaseInProgress. This is the case Codex flagged: the agent might
+        // exit zero with a clean `git status` while a rebase is still paused.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_repo = tmp.path().join("main");
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir(&main_repo).unwrap();
+
+        run_git(&main_repo, &["init", "--initial-branch=main"]);
+        std::fs::write(main_repo.join("seed.txt"), "seed\n").unwrap();
+        run_git(&main_repo, &["add", "seed.txt"]);
+        run_git(&main_repo, &["commit", "-m", "seed"]);
+        run_git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/issue-5",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        // Plant a rebase-merge marker under the linked worktree's resolved
+        // gitdir. We don't want to actually trigger a rebase conflict (that's
+        // brittle to git versions) — the directory's existence is the signal
+        // we read. Git itself uses this same convention to detect a paused
+        // rebase.
+        let resolved = resolve_git_dir(&linked).await.expect("gitdir");
+        std::fs::create_dir_all(resolved.join("rebase-merge")).unwrap();
+
+        let outcome = verify_rebase_outcome(&linked).await;
+        assert_eq!(outcome, RebaseOutcome::RebaseInProgress);
+    }
+
+    #[tokio::test]
+    async fn verify_rebase_outcome_returns_clean_for_quiescent_linked_worktree() {
+        // Counterpart to the previous test: when no rebase markers exist and
+        // status is clean, we should return Clean (so `finalize_fix_run_success`
+        // proceeds to re-request review). Asserts the gitdir-resolution path
+        // doesn't accidentally treat *every* linked worktree as in-progress.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_repo = tmp.path().join("main");
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir(&main_repo).unwrap();
+
+        run_git(&main_repo, &["init", "--initial-branch=main"]);
+        std::fs::write(main_repo.join("seed.txt"), "seed\n").unwrap();
+        run_git(&main_repo, &["add", "seed.txt"]);
+        run_git(&main_repo, &["commit", "-m", "seed"]);
+        run_git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/issue-5",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        let outcome = verify_rebase_outcome(&linked).await;
+        assert_eq!(outcome, RebaseOutcome::Clean);
     }
 
     #[test]
