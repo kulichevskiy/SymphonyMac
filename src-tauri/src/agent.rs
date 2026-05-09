@@ -16,6 +16,60 @@ pub mod runtime_helpers {
     }
 }
 
+pub mod pipeline_helpers {
+    //! Thin wrappers over `pipeline` and `runtime` so the orchestrator's review
+    //! poll loop can spawn fix-runs and bump `review_iteration` without
+    //! depending on the private pipeline API.
+
+    use super::pipeline;
+    use super::runtime;
+    use crate::SharedState;
+    use tauri::AppHandle;
+
+    pub(crate) use super::pipeline::FixRunSnapshot;
+
+    /// Spawn a Review-stage fix-run agent for the given snapshot.
+    pub fn spawn_fix_run(app: &AppHandle, state: &SharedState, snapshot: FixRunSnapshot) {
+        pipeline::spawn_fix_run(app.clone(), state.clone(), snapshot);
+    }
+
+    /// Update `review_iteration` on the Review run. Persisted.
+    pub async fn set_review_iteration(state: &SharedState, run_id: &str, iteration: u32) {
+        let _ = runtime::mutate_run(state, run_id, true, move |run| {
+            run.review_iteration = iteration;
+        })
+        .await;
+    }
+
+    /// Synchronously transition the Review run from `Running` (polling
+    /// sentinel) to `Preparing` (fix-run is being dispatched). Must be awaited
+    /// *before* `tokio::spawn` is called for the fix-run, so the next poll tick
+    /// observes the run in `Preparing` and skips it instead of double-spawning.
+    pub async fn mark_review_run_dispatching_fix_run(
+        app: &AppHandle,
+        state: &SharedState,
+        run_id: &str,
+    ) {
+        use crate::orchestrator::{AgentStatus, PipelineStage};
+        let _ = runtime::transition_run(
+            app,
+            state,
+            run_id,
+            runtime::StatusTransition {
+                status: AgentStatus::Preparing,
+                stage_label: PipelineStage::Review.to_string(),
+                error: None,
+                finished: false,
+                log_message: None,
+                pending_next_stage: runtime::PendingNextStageUpdate::Keep,
+                emit_extra: serde_json::Map::new(),
+                persist_meta: true,
+            },
+        )
+        .await;
+    }
+}
+
 use self::pipeline::{
     PipelineCompletionSpec, StageLaunchSpec, prepare_and_register_stage_run, spawn_next_stage,
 };
@@ -141,6 +195,7 @@ pub async fn advance_review_to_merge(
             max_retries,
             previous_error: String::new(),
             previous_context,
+            is_fix_run: false,
         },
     );
 }
@@ -190,6 +245,7 @@ pub async fn launch_agent(
         max_retries: config.max_retries,
         previous_error: String::new(),
         previous_context: None,
+        is_fix_run: false,
     };
 
     if matches!(stage, PipelineStage::Review) {
@@ -447,6 +503,7 @@ pub async fn approve_stage(
         },
         previous_error: String::new(),
         previous_context,
+        is_fix_run: false,
     };
 
     if matches!(next_stage, PipelineStage::Review) {
@@ -692,6 +749,7 @@ pub async fn advance_to_stage(
         max_retries,
         previous_error: String::new(),
         previous_context,
+        is_fix_run: false,
     };
 
     if matches!(effective_stage, PipelineStage::Review) {

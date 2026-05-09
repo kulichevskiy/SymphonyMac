@@ -63,22 +63,29 @@ pub(crate) async fn run_agent_process(
         }
     }
 
-    let _ = runtime::transition_run(
-        &app,
-        &state,
-        &request.run_id,
-        StatusTransition {
-            status: AgentStatus::Running,
-            stage_label: stage_label.clone(),
-            error: None,
-            finished: false,
-            log_message: None,
-            pending_next_stage: PendingNextStageUpdate::Keep,
-            emit_extra: Map::new(),
-            persist_meta: false,
-        },
-    )
-    .await;
+    if !request.spec.is_fix_run {
+        // Fix-runs are intentionally kept in `Preparing` for the lifetime of
+        // the subprocess so the Review poll loop's `status == Running` filter
+        // skips them. `finalize_fix_run_success` flips them back to Running on
+        // success; the failure path transitions to Failed instead. Calling
+        // transition_run(Running) here would defeat the double-spawn guard.
+        let _ = runtime::transition_run(
+            &app,
+            &state,
+            &request.run_id,
+            StatusTransition {
+                status: AgentStatus::Running,
+                stage_label: stage_label.clone(),
+                error: None,
+                finished: false,
+                log_message: None,
+                pending_next_stage: PendingNextStageUpdate::Keep,
+                emit_extra: Map::new(),
+                persist_meta: false,
+            },
+        )
+        .await;
+    }
 
     let gh_token = std::process::Command::new(crate::paths::resolve("gh"))
         .args(["auth", "token"])
@@ -237,10 +244,11 @@ pub(crate) async fn run_agent_process(
             if timed_out {
                 let is_running = {
                     let s = stall_state.lock().await;
-                    s.runs
-                        .get(&stall_run_id)
-                        .map(|run| run.status == AgentStatus::Running)
-                        .unwrap_or(false)
+                    // Same PID-based liveness check as the post-notify branch
+                    // below: fix-runs sit in `Preparing` for the entire
+                    // subprocess lifetime, so a status-only check would let a
+                    // stalled fix-run hang the Review run forever.
+                    s.agent_pids.contains_key(&stall_run_id)
                 };
 
                 if !is_running {
@@ -294,10 +302,12 @@ pub(crate) async fn run_agent_process(
 
             let is_running = {
                 let s = stall_state.lock().await;
-                s.runs
-                    .get(&stall_run_id)
-                    .map(|run| run.status == AgentStatus::Running)
-                    .unwrap_or(false)
+                // Check `agent_pids` rather than the run's status: fix-runs
+                // stay in `Preparing` for the lifetime of the subprocess, so a
+                // status-only check would skip stall handling for them and
+                // leak the PID. The PID is removed exactly when the subprocess
+                // exits, which is the right cutoff here.
+                s.agent_pids.contains_key(&stall_run_id)
             };
             if !is_running {
                 return false;
@@ -349,6 +359,13 @@ pub(crate) async fn run_agent_process(
             },
         )
         .await;
+    } else if request.spec.is_fix_run {
+        // Fix-runs hold the Review run in Running while the subprocess executes
+        // and stay Running after success — `finalize_fix_run_success` re-posts
+        // `@codex review` and transitions back to Running with a fresh SHA.
+        // We just need to flush the pending status emit so the UI sees the
+        // subprocess finished cleanly.
+        let _ = emit_extra;
     } else {
         let _ = runtime::transition_run(
             &app,
@@ -382,7 +399,51 @@ pub(crate) async fn run_agent_process(
     run_after_run_hook(&state, &request.run_id, &request.spec.workspace_path).await;
 
     if !succeeded {
+        // Fix-run failures share the same exhausted-failure handling as other
+        // stages — `handle_failed_attempt` emits `notify_pipeline_failed` and
+        // honors `cleanup_on_failure`. Fix-run specs hardcode `max_retries=0`,
+        // so `decide_failure_action` always returns `Exhausted` and no retry
+        // is spawned (which is what we want — fix-runs are one-shot).
         handle_failed_attempt(&app, &state, &request, &stage_label).await;
+        return;
+    }
+
+    if request.spec.is_fix_run {
+        if let Err(error) = pipeline::finalize_fix_run_success(
+            &app,
+            &state,
+            &request.run_id,
+            &request.spec.repo,
+            request.spec.issue_number,
+        )
+        .await
+        {
+            // The agent itself succeeded but the post-push step (re-posting
+            // `@codex review` or refreshing PR HEAD) failed — surface that as
+            // a stage failure with the same notification/cleanup treatment as
+            // any other exhausted failure, so it isn't silently swallowed.
+            let mut emit_extra = Map::new();
+            emit_extra.insert("error".to_string(), json!(error.clone()));
+            let _ = runtime::transition_run(
+                &app,
+                &state,
+                &request.run_id,
+                StatusTransition {
+                    status: AgentStatus::Failed,
+                    stage_label: stage_label.clone(),
+                    error: Some(error.clone()),
+                    finished: true,
+                    log_message: Some(format!("[review] {}", error)),
+                    pending_next_stage: PendingNextStageUpdate::Keep,
+                    emit_extra,
+                    persist_meta: true,
+                },
+            )
+            .await;
+            handle_failed_attempt(&app, &state, &request, &stage_label).await;
+            return;
+        }
+        runtime::update_dock_badge(&state).await;
         return;
     }
 
@@ -939,6 +1000,7 @@ fn next_stage_spec(
         max_retries: current.max_retries,
         previous_error,
         previous_context,
+        is_fix_run: false,
     }
 }
 

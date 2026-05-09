@@ -57,7 +57,12 @@ last_pushed_sha: string | null,
  * RFC3339 timestamp of when `@codex review` was last posted for this run.
  * Comments before this timestamp are ignored when checking for approval.
  */
-last_review_request_at: string | null, };
+last_review_request_at: string | null, 
+/**
+ * Number of fix-runs spawned for this Review run in response to Codex feedback.
+ * Starts at 0 (no feedback received yet); incremented before each fix-run is spawned.
+ */
+review_iteration: number, };
 
 export type AgentStatus = "preparing" | "running" | "completed" | "failed" | "stopped" | "interrupted" | "awaiting_approval";
 
@@ -146,7 +151,7 @@ local_repos: { [key in string]: string },
  */
 custom_agent_command: string, };
 
-export type RunSummary = { id: string, repo: string, issue_number: bigint, issue_title: string, status: AgentStatus, stage: PipelineStage, started_at: string, finished_at: string | null, workspace_path: string, error: string | null, attempt: number, max_retries: number, command_display: string | null, agent_type: string, last_log_line: string | null, log_count: number, activity: string | null, last_log_timestamp: string | null, skipped_stages: Array<string>, pending_next_stage: string | null, };
+export type RunSummary = { id: string, repo: string, issue_number: bigint, issue_title: string, status: AgentStatus, stage: PipelineStage, started_at: string, finished_at: string | null, workspace_path: string, error: string | null, attempt: number, max_retries: number, command_display: string | null, agent_type: string, last_log_line: string | null, log_count: number, activity: string | null, last_log_timestamp: string | null, skipped_stages: Array<string>, pending_next_stage: string | null, review_iteration: number, };
 
 /**
  * Structured context generated at the end of each pipeline stage,

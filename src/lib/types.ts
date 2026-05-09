@@ -56,6 +56,7 @@ export interface AgentRun {
   last_log_line?: string | null;
   log_count?: number;
   activity?: string | null;
+  review_iteration?: number;
 }
 
 export interface Issue {

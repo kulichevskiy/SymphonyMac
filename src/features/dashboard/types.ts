@@ -17,6 +17,7 @@ export interface KanbanCard {
   blockedBy?: number[];
   skippedStages?: string[];
   pendingNextStage?: string | null;
+  reviewIteration?: number;
 }
 
 export interface DashboardColumn {

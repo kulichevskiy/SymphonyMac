@@ -200,6 +200,10 @@ pub struct AgentRun {
     /// Comments before this timestamp are ignored when checking for approval.
     #[serde(default)]
     pub last_review_request_at: Option<String>,
+    /// Number of fix-runs spawned for this Review run in response to Codex feedback.
+    /// Starts at 0 (no feedback received yet); incremented before each fix-run is spawned.
+    #[serde(default)]
+    pub review_iteration: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -227,6 +231,8 @@ pub struct RunSummary {
     pub skipped_stages: Vec<String>,
     #[serde(default)]
     pub pending_next_stage: Option<String>,
+    #[serde(default)]
+    pub review_iteration: u32,
 }
 
 impl From<&AgentRun> for RunSummary {
@@ -252,6 +258,7 @@ impl From<&AgentRun> for RunSummary {
             last_log_timestamp: run.last_log_timestamp.clone(),
             skipped_stages: run.skipped_stages.clone(),
             pending_next_stage: run.pending_next_stage.clone(),
+            review_iteration: run.review_iteration,
         }
     }
 }
@@ -949,6 +956,7 @@ mod tests {
             pending_next_stage: Some("merge".to_string()),
             last_pushed_sha: None,
             last_review_request_at: None,
+            review_iteration: 0,
         }
     }
 
@@ -1046,6 +1054,7 @@ mod tests {
             pending_next_stage: Some("merge".to_string()),
             last_pushed_sha: None,
             last_review_request_at: None,
+            review_iteration: 0,
         }
     }
 
