@@ -1,5 +1,6 @@
 use crate::github::{self, PrComment};
 use crate::SharedState;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::AppHandle;
 
@@ -23,30 +24,31 @@ struct ReviewRunSnapshot {
 pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
     let (snapshots, approve_patterns, feedback_marker) = {
         let s = state.lock().await;
-        // Only Running Review runs are polling sentinels — fix-runs being
-        // dispatched or executing are flipped to Preparing under-lock by
-        // `mark_review_run_dispatching_fix_run`, so this filter alone prevents
-        // the poll loop from re-entering for an in-flight fix-run.
-        let snapshots: Vec<ReviewRunSnapshot> = s
-            .runs
-            .values()
-            .filter(|run| {
-                run.stage == PipelineStage::Review && run.status == AgentStatus::Running
-            })
-            .map(|run| ReviewRunSnapshot {
-                run_id: run.id.clone(),
-                repo: run.repo.clone(),
-                issue_number: run.issue_number,
-                issue_title: run.issue_title.clone(),
-                issue_body: String::new(),
-                issue_labels: run.issue_labels.clone(),
-                workspace_path: run.workspace_path.clone(),
-                last_review_request_at: run.last_review_request_at.clone(),
-                last_pushed_sha: run.last_pushed_sha.clone(),
-                review_iteration: run.review_iteration,
-                stage_context: run.stage_context.clone(),
-            })
-            .collect();
+        // Only the latest Running Review sentinel per (repo, issue) participates
+        // in polling. Older Running sentinels (e.g. left over from a manual
+        // re-launch) are silent. Without this dedupe, two sentinels for the
+        // same issue would either deadlock on each other (if the duplicate
+        // guard matched Running) or re-dispatch fix-runs against feedback the
+        // latest sentinel already handled (if it didn't). A run in `Preparing`
+        // (fix-run in flight) is not eligible to be the polling sentinel and
+        // is filtered out by the helper.
+        let snapshots: Vec<ReviewRunSnapshot> =
+            latest_running_review_per_issue(s.runs.values())
+                .into_iter()
+                .map(|run| ReviewRunSnapshot {
+                    run_id: run.id.clone(),
+                    repo: run.repo.clone(),
+                    issue_number: run.issue_number,
+                    issue_title: run.issue_title.clone(),
+                    issue_body: String::new(),
+                    issue_labels: run.issue_labels.clone(),
+                    workspace_path: run.workspace_path.clone(),
+                    last_review_request_at: run.last_review_request_at.clone(),
+                    last_pushed_sha: run.last_pushed_sha.clone(),
+                    review_iteration: run.review_iteration,
+                    stage_context: run.stage_context.clone(),
+                })
+                .collect();
         (
             snapshots,
             s.config.codex_approve_patterns.clone(),
@@ -57,6 +59,30 @@ pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
     for snapshot in snapshots {
         check_codex_activity(app, state, snapshot, &approve_patterns, &feedback_marker).await;
     }
+}
+
+/// Pure helper that selects the latest Running Review sentinel per
+/// (repo, issue) from a flat list. Extracted so the dedupe logic is
+/// directly unit-testable.
+fn latest_running_review_per_issue<'a>(
+    runs: impl IntoIterator<Item = &'a crate::orchestrator::AgentRun>,
+) -> Vec<&'a crate::orchestrator::AgentRun> {
+    let mut latest_by_issue: HashMap<(String, u64), &crate::orchestrator::AgentRun> =
+        HashMap::new();
+    for run in runs.into_iter().filter(|run| {
+        run.stage == PipelineStage::Review && run.status == AgentStatus::Running
+    }) {
+        let key = (run.repo.clone(), run.issue_number);
+        latest_by_issue
+            .entry(key)
+            .and_modify(|existing| {
+                if run.started_at > existing.started_at {
+                    *existing = run;
+                }
+            })
+            .or_insert(run);
+    }
+    latest_by_issue.into_values().collect()
 }
 
 async fn check_codex_activity(
@@ -446,6 +472,71 @@ mod tests {
         assert!(head_sha_matches(None, Some("abc123")));
         assert!(head_sha_matches(Some("abc123"), None));
         assert!(head_sha_matches(None, None));
+    }
+
+    fn make_review_run(
+        id: &str,
+        issue_number: u64,
+        status: AgentStatus,
+        started_at: &str,
+    ) -> crate::orchestrator::AgentRun {
+        crate::orchestrator::AgentRun {
+            id: id.to_string(),
+            repo: "kulichevskiy/SymphonyMac".to_string(),
+            issue_number,
+            issue_title: "test".to_string(),
+            status,
+            stage: PipelineStage::Review,
+            started_at: started_at.to_string(),
+            finished_at: None,
+            logs: vec![],
+            workspace_path: "/tmp/x".to_string(),
+            error: None,
+            attempt: 1,
+            max_retries: 0,
+            lines_added: 0,
+            lines_removed: 0,
+            files_modified_list: vec![],
+            report: None,
+            command_display: None,
+            agent_type: "claude".to_string(),
+            last_log_line: None,
+            log_count: 0,
+            activity: None,
+            last_log_timestamp: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+            issue_labels: vec![],
+            skipped_stages: vec![],
+            stage_context: None,
+            pending_next_stage: None,
+            last_pushed_sha: None,
+            last_review_request_at: None,
+            review_iteration: 0,
+        }
+    }
+
+    #[test]
+    fn latest_running_review_per_issue_dedupes_to_newest_started_at() {
+        let older = make_review_run("older", 42, AgentStatus::Running, "2026-05-09T10:00:00Z");
+        let newer = make_review_run("newer", 42, AgentStatus::Running, "2026-05-09T11:00:00Z");
+        let other_issue =
+            make_review_run("other-issue", 43, AgentStatus::Running, "2026-05-09T09:00:00Z");
+        let preparing =
+            make_review_run("preparing", 42, AgentStatus::Preparing, "2026-05-09T11:30:00Z");
+        let stopped =
+            make_review_run("stopped", 42, AgentStatus::Stopped, "2026-05-09T12:00:00Z");
+
+        let runs = vec![older, newer, other_issue, preparing, stopped];
+        let result = latest_running_review_per_issue(runs.iter());
+        let mut ids: Vec<&str> = result.iter().map(|r| r.id.as_str()).collect();
+        ids.sort();
+
+        // Issue 42: only the newest Running run (`newer`) — `older` is dropped,
+        // and Preparing/Stopped runs are filtered out entirely.
+        // Issue 43: the lone Running sentinel survives.
+        assert_eq!(ids, vec!["newer", "other-issue"]);
     }
 
     #[test]
