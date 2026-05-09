@@ -2,6 +2,8 @@ use super::pipeline::{
     self, AgentProcessRequest, FailureAction, MergeVerification, PipelineCompletionSpec,
     StageLaunchSpec, SuccessfulStageAction,
 };
+use super::prompt::RED_GATE_RETRY_MARKER;
+use super::red_gate::{self, RedGateOutcome};
 use super::runtime::{self, PendingNextStageUpdate, StatusTransition};
 use crate::orchestrator::{AgentStatus, PipelineStage};
 use crate::workspace;
@@ -382,6 +384,31 @@ pub(crate) async fn run_agent_process(
     if !succeeded {
         handle_failed_attempt(&app, &state, &request, &stage_label).await;
         return;
+    }
+
+    if request.spec.stage == PipelineStage::Implement {
+        if let Some(gate_failure) = run_implement_red_gate(&state, &request).await {
+            let mut emit_extra = Map::new();
+            emit_extra.insert("error".to_string(), json!(gate_failure.clone()));
+            let _ = runtime::transition_run(
+                &app,
+                &state,
+                &request.run_id,
+                StatusTransition {
+                    status: AgentStatus::Failed,
+                    stage_label: stage_label.clone(),
+                    error: Some(gate_failure),
+                    finished: true,
+                    log_message: None,
+                    pending_next_stage: PendingNextStageUpdate::Keep,
+                    emit_extra,
+                    persist_meta: true,
+                },
+            )
+            .await;
+            handle_failed_attempt(&app, &state, &request, &stage_label).await;
+            return;
+        }
     }
 
     let stage_context = {
@@ -808,6 +835,41 @@ async fn run_after_run_hook(state: &SharedState, run_id: &str, workspace_path: &
             )
             .await;
         }
+    }
+}
+
+/// Run the TDD red-gate after a successful Implement stage. On success or
+/// skip, appends a one-line outcome to the run log and returns `None`. On
+/// failure, returns the marker-prefixed error string the retry should carry as
+/// `previous_error`.
+async fn run_implement_red_gate(
+    state: &SharedState,
+    request: &AgentProcessRequest,
+) -> Option<String> {
+    let workspace = request.spec.workspace_path.clone();
+    let labels = request.spec.issue_labels.clone();
+
+    let base_ref = match red_gate::resolve_base_ref(&workspace).await {
+        Ok(reference) => reference,
+        Err(error) => {
+            let warning = format!(
+                "[red-gate] Skipped: could not resolve base ref ({}). \
+Falling through to next stage.",
+                error
+            );
+            runtime::append_run_log(state, &request.run_id, warning, false, true).await;
+            return None;
+        }
+    };
+
+    let outcome = red_gate::run_red_gate(&workspace, &base_ref, &labels).await;
+    let summary = outcome.human_summary();
+    runtime::append_run_log(state, &request.run_id, summary.clone(), false, true).await;
+
+    if matches!(outcome, RedGateOutcome::Failed(_)) {
+        Some(format!("{} {}", RED_GATE_RETRY_MARKER, summary))
+    } else {
+        None
     }
 }
 
