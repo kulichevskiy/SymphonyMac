@@ -519,10 +519,11 @@ pub fn cumulative_cost_for_issue(state: &OrchestratorState, repo: &str, issue_nu
 
 /// Build a (repo, issue_number) → cumulative-cost map from the run map in a
 /// single pass. Equivalent to calling `cumulative_cost_for_issue` for every
-/// distinct (repo, issue) but O(N) instead of O(N²) — required for
-/// `build_overview` because it produces one `RunSummary` per run and would
-/// otherwise rescan `state.runs` for each one.
-fn aggregate_issue_costs(state: &OrchestratorState) -> HashMap<(String, u64), f64> {
+/// distinct (repo, issue) but O(N) instead of O(N²). Used by `build_overview`
+/// (one summary per run) and by the review-stage poll loop (one entry per
+/// running sentinel) so neither path re-scans `state.runs` per record while
+/// holding the orchestrator lock.
+pub(crate) fn aggregate_issue_costs(state: &OrchestratorState) -> HashMap<(String, u64), f64> {
     let mut totals: HashMap<(String, u64), f64> = HashMap::new();
     for run in state.runs.values() {
         *totals

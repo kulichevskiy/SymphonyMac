@@ -69,6 +69,10 @@ pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
         let s = state.lock().await;
         let max_review_iterations = s.config.max_review_iterations;
         let cost_cap_per_issue_usd = s.config.cost_cap_per_issue_usd;
+        // Single-pass cost aggregation per poll tick. Reading from this map
+        // when filling each snapshot keeps the under-lock cost O(N) over the
+        // run table instead of O(R×N) where R = active review sentinels.
+        let issue_costs = crate::orchestrator::aggregate_issue_costs(&s);
         // Only the latest Running Review sentinel per (repo, issue) participates
         // in polling. Older Running sentinels (e.g. left over from a manual
         // re-launch) are silent. Without this dedupe, two sentinels for the
@@ -81,8 +85,10 @@ pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
             latest_running_review_per_issue(s.runs.values())
                 .into_iter()
                 .map(|run| {
-                    let issue_cost_usd =
-                        crate::orchestrator::cumulative_cost_for_issue(&s, &run.repo, run.issue_number);
+                    let issue_cost_usd = issue_costs
+                        .get(&(run.repo.clone(), run.issue_number))
+                        .copied()
+                        .unwrap_or(0.0);
                     ReviewRunSnapshot {
                         run_id: run.id.clone(),
                         repo: run.repo.clone(),
