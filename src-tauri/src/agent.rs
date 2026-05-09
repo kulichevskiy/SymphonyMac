@@ -117,6 +117,14 @@ pub async fn advance_review_to_merge(
     )
     .await;
 
+    // Re-fetch the issue body so the Merge prompt (and any custom `{{issue_body}}`
+    // template) has full context. The Review poller doesn't carry the body in its
+    // snapshot, and Merge runs may rely on it.
+    let issue_body = match crate::github::get_issue_detail(ctx.repo.clone(), ctx.issue_number).await {
+        Ok(issue) => issue.body.unwrap_or_default(),
+        Err(_) => ctx.issue_body,
+    };
+
     spawn_next_stage(
         app.clone(),
         state.clone(),
@@ -124,7 +132,7 @@ pub async fn advance_review_to_merge(
             repo: ctx.repo,
             issue_number: ctx.issue_number,
             issue_title: ctx.issue_title,
-            issue_body: ctx.issue_body,
+            issue_body,
             stage: PipelineStage::Merge,
             issue_labels: ctx.issue_labels,
             workspace_path: std::path::PathBuf::from(ctx.workspace_path),

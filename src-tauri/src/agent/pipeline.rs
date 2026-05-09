@@ -225,12 +225,11 @@ pub(crate) async fn start_review_stage(
     )
     .await;
 
-    let pr_number = match resolve_pr_for_review(state, &run_id, &spec).await {
-        Some(number) => number,
+    let (pr_number, head_sha) = match resolve_pr_for_review(state, &run_id, &spec).await {
+        Some(pr) => (pr.number, pr.head_ref_oid),
         None => return Some(run_id),
     };
 
-    let head_sha = capture_head_sha(&spec.workspace_path).await;
     let request_timestamp = Utc::now().to_rfc3339();
 
     if let Err(error) = crate::github::post_codex_review(&spec.repo, pr_number).await {
@@ -270,7 +269,7 @@ pub(crate) async fn start_review_stage(
         pr_number,
         head_sha
             .as_ref()
-            .map(|sha| format!(", HEAD {}", sha))
+            .map(|sha| format!(", PR HEAD {}", sha))
             .unwrap_or_default(),
     );
     super::runtime::append_run_log(state, &run_id, posted_log, true, true).await;
@@ -330,9 +329,9 @@ async fn resolve_pr_for_review(
     state: &SharedState,
     run_id: &str,
     spec: &StageLaunchSpec,
-) -> Option<u64> {
+) -> Option<crate::github::PullRequestFullState> {
     match crate::github::pr_full_state(&spec.repo, spec.issue_number).await {
-        Ok(Some(pr)) => Some(pr.number),
+        Ok(Some(pr)) => Some(pr),
         Ok(None) => {
             let error = format!(
                 "No PR found for issue #{} — cannot start Review stage.",
@@ -363,25 +362,6 @@ async fn fail_review_run(state: &SharedState, run_id: &str, error: String) {
         run.finished_at = Some(Utc::now().to_rfc3339());
     })
     .await;
-}
-
-async fn capture_head_sha(workspace_path: &std::path::Path) -> Option<String> {
-    let output = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(workspace_path)
-        .env("PATH", crate::paths::build_path_env())
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if sha.is_empty() {
-        None
-    } else {
-        Some(sha)
-    }
 }
 
 pub(crate) fn spawn_retry(
