@@ -108,11 +108,57 @@ pub struct GhCliGateway;
 impl GitHubGateway for GhCliGateway {
     async fn list_repos(&self, filter: Option<String>) -> Result<Vec<Repo>, String> {
         let json_fields = "nameWithOwner,name,owner,description,url,defaultBranchRef,isPrivate";
-        let output = run_gh(&["repo", "list", "--limit", "100", "--json", json_fields]).await?;
-        let raw: Vec<serde_json::Value> = serde_json::from_str(&output)
+
+        let personal_args: [&str; 6] =
+            ["repo", "list", "--limit", "200", "--json", json_fields];
+        let orgs_args: [&str; 4] = ["api", "/user/orgs", "--jq", "[.[].login]"];
+        let (personal_result, orgs_result) =
+            tokio::join!(run_gh(&personal_args), run_gh(&orgs_args));
+
+        let personal_output = personal_result?;
+        let mut all_raw: Vec<serde_json::Value> = serde_json::from_str(&personal_output)
             .map_err(|e| format!("Failed to parse repos JSON: {}", e))?;
 
-        let mut repos: Vec<Repo> = raw.iter().map(parse_repo).collect();
+        // Org listing is best-effort: a user may not be in any org, or the
+        // gh token may lack `read:org`. Fall through to personal-only on error.
+        if let Ok(orgs_output) = orgs_result {
+            let orgs: Vec<String> =
+                serde_json::from_str(orgs_output.trim()).unwrap_or_default();
+
+            let mut set = tokio::task::JoinSet::new();
+            for org in orgs {
+                let fields = json_fields.to_string();
+                set.spawn(async move {
+                    run_gh(&[
+                        "repo", "list", &org, "--limit", "200", "--json", &fields,
+                    ])
+                    .await
+                });
+            }
+            while let Some(joined) = set.join_next().await {
+                if let Ok(Ok(output)) = joined {
+                    if let Ok(raw) =
+                        serde_json::from_str::<Vec<serde_json::Value>>(&output)
+                    {
+                        all_raw.extend(raw);
+                    }
+                }
+            }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut repos: Vec<Repo> = Vec::new();
+        for value in &all_raw {
+            let repo = parse_repo(value);
+            if repo.full_name.is_empty() {
+                continue;
+            }
+            if seen.insert(repo.full_name.clone()) {
+                repos.push(repo);
+            }
+        }
+        repos.sort_by(|a, b| a.full_name.to_lowercase().cmp(&b.full_name.to_lowercase()));
+
         if let Some(filter) = filter {
             let filter = filter.to_lowercase();
             repos.retain(|repo| repo.full_name.to_lowercase().contains(&filter));
