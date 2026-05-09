@@ -747,6 +747,13 @@ pub async fn pr_ci_status(repo: &str, pr_number: u64) -> Result<PrCiStatus, Stri
 /// `max_chars` so we don't blow up the agent prompt. Returns `None` when the
 /// `gh run view` command fails for any reason — we surface the check name and
 /// state regardless, so a missing log shouldn't block the fix-run.
+///
+/// IMPORTANT: callers must treat the returned text as **untrusted user input**
+/// (anyone who can edit a workflow can write arbitrary text into a failing
+/// log, including prompt-injection text). This function strips ANSI escape
+/// sequences and most control characters before truncation so the raw bytes
+/// can't manipulate terminal display, but the *content* is still adversarial
+/// — the fix-run prompt must fence it explicitly.
 pub async fn run_failure_log_excerpt(
     repo: &str,
     run_id: &str,
@@ -762,11 +769,63 @@ pub async fn run_failure_log_excerpt(
         return None;
     }
     let raw = String::from_utf8(output.stdout).ok()?;
-    let trimmed = raw.trim();
+    let sanitized = sanitize_untrusted_log(&raw);
+    let trimmed = sanitized.trim();
     if trimmed.is_empty() {
         return None;
     }
     Some(truncate_chars(trimmed, max_chars))
+}
+
+/// Strip control characters and ANSI escape sequences from a raw log blob so
+/// it can be safely embedded as fenced text in a downstream agent prompt.
+///
+/// We keep `\n` and `\t` (legitimate in compiler output) but drop:
+/// - ESC sequences (`\x1b[...m`, etc.) used to color/move terminal output
+/// - Other C0 controls (`\x00..\x1F` minus `\n`/`\t`) and `\x7f`
+///
+/// Sanitization is defense-in-depth: even with the prompt's fence markers,
+/// stripping ANSI keeps the fenced data textually clean and avoids confusing
+/// the agent with terminal-escape garbage.
+pub(crate) fn sanitize_untrusted_log(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                // Drop the entire escape sequence. The most common forms are
+                // CSI (`ESC [ ... <final>`) and OSC (`ESC ] ... BEL/ST`); we
+                // approximate by consuming up to the next ASCII letter or
+                // bell, which covers both without a full ANSI parser.
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    while let Some(&next) = chars.peek() {
+                        chars.next();
+                        if next.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else if chars.peek() == Some(&']') {
+                    chars.next();
+                    while let Some(&next) = chars.peek() {
+                        chars.next();
+                        if next == '\x07' {
+                            break;
+                        }
+                    }
+                } else {
+                    // Two-byte escape (e.g. ESC =) — skip the next char.
+                    chars.next();
+                }
+            }
+            '\n' | '\t' => out.push(c),
+            c if (c as u32) < 0x20 || c == '\x7f' => {
+                // Other control chars: drop silently rather than render.
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -1424,6 +1483,42 @@ mod tests {
         assert!(parse_actions_run_id("https://jenkins.example.com/job/ci").is_none());
         assert!(parse_actions_run_id("").is_none());
         assert!(parse_actions_run_id("https://github.com/owner/repo/actions/runs/abc").is_none());
+    }
+
+    #[test]
+    fn sanitize_untrusted_log_strips_ansi_csi_color_sequences() {
+        // Common CI output: `gcc` / `cargo` / `pytest` color codes.
+        let raw = "\x1b[31mFAILED\x1b[0m tests/foo.rs\n\x1b[1;33mwarning\x1b[0m: dead";
+        let cleaned = sanitize_untrusted_log(raw);
+        assert!(!cleaned.contains('\x1b'));
+        assert!(cleaned.contains("FAILED tests/foo.rs"));
+        assert!(cleaned.contains("warning: dead"));
+    }
+
+    #[test]
+    fn sanitize_untrusted_log_strips_osc_terminal_title_sequences() {
+        // OSC sequences (used to set terminal title) end with BEL or ST.
+        let raw = "before\x1b]0;malicious title\x07after";
+        let cleaned = sanitize_untrusted_log(raw);
+        assert_eq!(cleaned, "beforeafter");
+    }
+
+    #[test]
+    fn sanitize_untrusted_log_keeps_newlines_and_tabs_drops_other_controls() {
+        // \n and \t are legitimate in compiler output — keep them. \r and
+        // other C0 controls (e.g. \x07 BEL outside an OSC) are dropped so
+        // they can't manipulate terminal state.
+        let raw = "ok\nline2\twith tab\rcarriage\x07bell";
+        let cleaned = sanitize_untrusted_log(raw);
+        assert_eq!(cleaned, "ok\nline2\twith tabcarriagebell");
+    }
+
+    #[test]
+    fn sanitize_untrusted_log_preserves_plain_text_unchanged() {
+        // No escapes, no controls — output equals input.
+        let raw = "error[E0382]: borrow of moved value\n  --> src/lib.rs:42:5";
+        let cleaned = sanitize_untrusted_log(raw);
+        assert_eq!(cleaned, raw);
     }
 
     #[test]
