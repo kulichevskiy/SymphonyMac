@@ -399,14 +399,11 @@ pub(crate) async fn run_agent_process(
     run_after_run_hook(&state, &request.run_id, &request.spec.workspace_path).await;
 
     if !succeeded {
-        if request.spec.is_fix_run {
-            // Fix-run failures terminate the Review run — there is no retry path
-            // (we set max_retries=0 on fix-run specs), and falling into
-            // `handle_failed_attempt` would only emit a duplicate failure
-            // notification. The Failed status was already set above.
-            runtime::update_dock_badge(&state).await;
-            return;
-        }
+        // Fix-run failures share the same exhausted-failure handling as other
+        // stages — `handle_failed_attempt` emits `notify_pipeline_failed` and
+        // honors `cleanup_on_failure`. Fix-run specs hardcode `max_retries=0`,
+        // so `decide_failure_action` always returns `Exhausted` and no retry
+        // is spawned (which is what we want — fix-runs are one-shot).
         handle_failed_attempt(&app, &state, &request, &stage_label).await;
         return;
     }
