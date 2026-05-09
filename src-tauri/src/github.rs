@@ -47,6 +47,23 @@ pub struct PullRequest {
     pub closes_issue: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrComment {
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// Full state of a PR, used by the Review-stage poll loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestFullState {
+    pub number: u64,
+    pub state: String,
+    pub head_ref_name: String,
+    pub head_ref_oid: Option<String>,
+    pub comments: Vec<PrComment>,
+}
+
 #[async_trait]
 pub trait GitHubGateway: Send + Sync {
     async fn list_repos(&self, filter: Option<String>) -> Result<Vec<Repo>, String>;
@@ -524,6 +541,122 @@ pub async fn is_pr_merged_for_issue(repo: &str, issue_number: u64) -> Result<boo
         .await
 }
 
+/// Find the open PR associated with `issue_number` in `repo`. Returns its full state
+/// (number, state, branch, HEAD oid, and comments) — used by the Review stage poll loop.
+///
+/// Restricted to `--state open` on purpose: an issue may have historical merged or
+/// closed PRs, but the Review stage targets the *active* PR. Picking up an old
+/// merged PR here would let `@codex review` go to the wrong thread and accept stale
+/// approvals.
+pub async fn pr_full_state(
+    repo: &str,
+    issue_number: u64,
+) -> Result<Option<PullRequestFullState>, String> {
+    let json_fields = "number,title,body,state,headRefName,headRefOid,comments";
+    let output = run_gh(&[
+        "pr",
+        "list",
+        "-R",
+        repo,
+        "--state",
+        "open",
+        "--limit",
+        "50",
+        "--json",
+        json_fields,
+    ])
+    .await?;
+
+    let prs: Vec<serde_json::Value> =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse PRs: {}", e))?;
+
+    Ok(select_pr_full_state(&prs, issue_number))
+}
+
+fn select_pr_full_state(
+    prs: &[serde_json::Value],
+    issue_number: u64,
+) -> Option<PullRequestFullState> {
+    for pr in prs {
+        let body = pr["body"].as_str().unwrap_or("");
+        let title = pr["title"].as_str().unwrap_or("");
+        let state = pr["state"].as_str().unwrap_or("");
+        let references_issue = parse_closes_issue(body) == Some(issue_number)
+            || parse_issue_from_title(title) == Some(issue_number);
+
+        // Defense in depth against API responses that include non-open PRs:
+        // even though we ask for `--state open`, ignore anything that came back
+        // tagged otherwise so a stale merged PR can never win this lookup.
+        if !references_issue || (!state.is_empty() && state != "OPEN") {
+            continue;
+        }
+
+        let comments = pr["comments"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| PrComment {
+                        author: item["author"]["login"].as_str().unwrap_or("").to_string(),
+                        body: item["body"].as_str().unwrap_or("").to_string(),
+                        created_at: item["createdAt"].as_str().unwrap_or("").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        return Some(PullRequestFullState {
+            number: pr["number"].as_u64().unwrap_or(0),
+            state: state.to_string(),
+            head_ref_name: pr["headRefName"].as_str().unwrap_or("").to_string(),
+            head_ref_oid: pr["headRefOid"].as_str().map(|s| s.to_string()),
+            comments,
+        });
+    }
+
+    None
+}
+
+/// Post `@codex review` as an issue-level comment on the given PR.
+pub async fn post_codex_review(repo: &str, pr_number: u64) -> Result<(), String> {
+    let pr_number_str = pr_number.to_string();
+    let _ = run_gh(&[
+        "pr",
+        "comment",
+        &pr_number_str,
+        "-R",
+        repo,
+        "--body",
+        "@codex review",
+    ])
+    .await?;
+    Ok(())
+}
+
+/// Returns true if `text` matches any of the configured Codex approval `patterns`
+/// (case-insensitive substring match).
+///
+/// `feedback_marker` is the trailing footer Codex appends to its review comments
+/// (e.g. "Useful? React with 👍 / 👎."). It is stripped from `text` before matching,
+/// so emoji or phrases inside the footer cannot cause false-positive approvals.
+pub fn parse_codex_approval(text: &str, patterns: &[String], feedback_marker: &str) -> bool {
+    if text.is_empty() || patterns.is_empty() {
+        return false;
+    }
+    let stripped = strip_feedback_marker(text, feedback_marker);
+    let lower = stripped.to_lowercase();
+    patterns
+        .iter()
+        .any(|pattern| !pattern.is_empty() && lower.contains(&pattern.to_lowercase()))
+}
+
+fn strip_feedback_marker<'a>(text: &'a str, feedback_marker: &str) -> std::borrow::Cow<'a, str> {
+    if feedback_marker.is_empty() || !text.contains(feedback_marker) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(text.replace(feedback_marker, ""))
+}
+
 #[tauri::command]
 pub async fn get_issue_detail(repo: String, number: u64) -> Result<Issue, String> {
     cli_gateway().get_issue_detail(&repo, number).await
@@ -662,5 +795,111 @@ mod tests {
         assert!(query.contains("issue_27: issue(number: 27)"));
         assert!(query.contains("owner: \"octo\\\"cat\""));
         assert!(query.contains("name: \"repo-name\""));
+    }
+
+    #[test]
+    fn test_parse_codex_approval_matches_default_patterns_case_insensitively() {
+        let patterns = vec![
+            "Didn't find any major issues".to_string(),
+            "did not find major issues".to_string(),
+        ];
+        let marker = "Useful? React with 👍 / 👎.";
+
+        // exact match (case-insensitive)
+        assert!(parse_codex_approval(
+            "DIDN'T FIND ANY MAJOR ISSUES — looks good to me.",
+            &patterns,
+            marker,
+        ));
+
+        // alt phrasing
+        assert!(parse_codex_approval(
+            "After review, did NOT find major issues.",
+            &patterns,
+            marker,
+        ));
+
+        // no match
+        assert!(!parse_codex_approval(
+            "Found a couple of issues that need fixing.",
+            &patterns,
+            marker,
+        ));
+
+        // empty inputs
+        assert!(!parse_codex_approval("", &patterns, marker));
+        assert!(!parse_codex_approval("anything", &[], marker));
+    }
+
+    #[test]
+    fn test_select_pr_full_state_skips_merged_pr_and_picks_open_one() {
+        // Simulates the case where an issue has both a historical merged PR and a
+        // current open PR. The selector must return the open one even if the
+        // merged PR appears first in the list.
+        let prs = serde_json::json!([
+            {
+                "number": 100,
+                "title": "Fix #42: old attempt",
+                "body": "Closes #42",
+                "state": "MERGED",
+                "headRefName": "old-branch",
+                "headRefOid": "old111",
+                "comments": []
+            },
+            {
+                "number": 200,
+                "title": "Fix #42: current attempt",
+                "body": "Closes #42",
+                "state": "OPEN",
+                "headRefName": "new-branch",
+                "headRefOid": "new222",
+                "comments": []
+            }
+        ]);
+        let prs_array = prs.as_array().unwrap();
+
+        let selected = select_pr_full_state(prs_array, 42).expect("an open PR should be selected");
+        assert_eq!(selected.number, 200);
+        assert_eq!(selected.state, "OPEN");
+        assert_eq!(selected.head_ref_oid.as_deref(), Some("new222"));
+    }
+
+    #[test]
+    fn test_select_pr_full_state_returns_none_when_no_open_pr_references_issue() {
+        let prs = serde_json::json!([
+            {
+                "number": 100,
+                "title": "Fix #42: old attempt",
+                "body": "Closes #42",
+                "state": "MERGED",
+                "headRefName": "old-branch",
+                "headRefOid": "old111",
+                "comments": []
+            }
+        ]);
+        let prs_array = prs.as_array().unwrap();
+        assert!(select_pr_full_state(prs_array, 42).is_none());
+    }
+
+    #[test]
+    fn test_parse_codex_approval_ignores_feedback_marker_footer() {
+        // A non-approving Codex comment with the footer (which contains 👍) should NOT match
+        // even if the patterns list contains a bare 👍 — the footer is stripped first.
+        let patterns = vec![
+            "Didn't find any major issues".to_string(),
+            "👍".to_string(),
+        ];
+        let marker = "Useful? React with 👍 / 👎.";
+
+        let non_approving_with_footer = "Found a P1 bug; please fix.\n\nUseful? React with 👍 / 👎.";
+        assert!(
+            !parse_codex_approval(non_approving_with_footer, &patterns, marker),
+            "footer-only 👍 must not be treated as approval"
+        );
+
+        // Real approval phrase still matches even with the footer.
+        let approving_with_footer =
+            "Didn't find any major issues.\n\nUseful? React with 👍 / 👎.";
+        assert!(parse_codex_approval(approving_with_footer, &patterns, marker));
     }
 }

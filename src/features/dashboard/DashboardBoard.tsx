@@ -2,17 +2,15 @@ import type { DashboardColumn, KanbanCard } from "./types";
 
 const STAGE_LABELS: Record<string, string> = {
   implement: "Implementing",
-  code_review: "Reviewing",
-  testing: "Testing",
+  review: "Reviewing",
   merge: "Merging",
 };
 
-const STAGE_ORDER = ["implement", "code_review", "testing", "merge"];
+const STAGE_ORDER = ["implement", "review", "merge"];
 
 const STAGE_DISPLAY: Record<string, string> = {
   implement: "Implement",
-  code_review: "Review",
-  testing: "Testing",
+  review: "Review",
   merge: "Merge",
 };
 

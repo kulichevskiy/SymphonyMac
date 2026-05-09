@@ -10,7 +10,6 @@ import {
   PriorityLabelsSection,
   PromptTemplatesSection,
   SettingsSaveBar,
-  StageSkipLabelsSection,
   WorkspaceCleanupSection,
 } from "./SettingsSections";
 import { WorkspacesSection } from "./WorkspacesSection";
@@ -36,8 +35,6 @@ interface SettingsViewProps {
   defaultPrompts: Record<string, string>;
   expandedStage: string | null;
   setExpandedStage: Dispatch<SetStateAction<string | null>>;
-  newSkipLabel: string;
-  setNewSkipLabel: Dispatch<SetStateAction<string>>;
   saveConfig: () => void;
   refreshWorkspaces: () => void;
   cleanupSingle: (path: string) => void;
@@ -57,8 +54,6 @@ export function SettingsView({
   defaultPrompts,
   expandedStage,
   setExpandedStage,
-  newSkipLabel,
-  setNewSkipLabel,
   saveConfig,
   refreshWorkspaces,
   cleanupSingle,
@@ -111,12 +106,6 @@ export function SettingsView({
                 <OrchestratorSection config={config} setConfig={setConfig} />
                 <PriorityLabelsSection config={config} setConfig={setConfig} />
                 <ApprovalGatesSection config={config} setConfig={setConfig} />
-                <StageSkipLabelsSection
-                  config={config}
-                  setConfig={setConfig}
-                  newSkipLabel={newSkipLabel}
-                  setNewSkipLabel={setNewSkipLabel}
-                />
               </>
             )}
 

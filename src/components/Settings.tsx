@@ -20,8 +20,6 @@ export function Settings() {
       defaultPrompts={controller.defaultPrompts}
       expandedStage={controller.expandedStage}
       setExpandedStage={controller.setExpandedStage}
-      newSkipLabel={controller.newSkipLabel}
-      setNewSkipLabel={controller.setNewSkipLabel}
       saveConfig={controller.saveConfig}
       refreshWorkspaces={controller.refreshWorkspaces}
       cleanupSingle={controller.cleanupSingle}

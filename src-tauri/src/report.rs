@@ -29,8 +29,7 @@ pub struct PipelineReport {
     pub pr_number: Option<u64>,
     pub pr_url: Option<String>,
     pub issue_url: String,
-    pub code_review_summary: String,
-    pub testing_summary: String,
+    pub review_summary: String,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cost_usd: f64,
@@ -46,13 +45,12 @@ pub fn generate_report(
     let mut total_duration: i64 = 0;
     let mut pr_number: Option<u64> = None;
     let mut pr_url: Option<String> = None;
-    let mut code_review_summary = String::new();
-    let mut testing_summary = String::new();
+    let mut review_summary = String::new();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut total_cost_usd: f64 = 0.0;
 
-    let stage_order = ["implement", "code_review", "testing", "merge"];
+    let stage_order = ["implement", "review", "merge"];
 
     for stage_name in &stage_order {
         let matching: Vec<&&AgentRun> = stage_runs
@@ -89,11 +87,8 @@ pub fn generate_report(
                 }
             }
 
-            if *stage_name == "code_review" {
-                code_review_summary = summary.clone();
-            }
-            if *stage_name == "testing" {
-                testing_summary = summary.clone();
+            if *stage_name == "review" {
+                review_summary = summary.clone();
             }
 
             total_input_tokens += run.input_tokens;
@@ -127,8 +122,7 @@ pub fn generate_report(
         pr_number,
         pr_url,
         issue_url,
-        code_review_summary,
-        testing_summary,
+        review_summary,
         total_input_tokens,
         total_output_tokens,
         total_cost_usd,
@@ -171,8 +165,7 @@ fn format_duration(secs: i64) -> String {
 fn format_stage_name(name: &str) -> String {
     match name {
         "implement" => "Implement".to_string(),
-        "code_review" => "Code Review".to_string(),
-        "testing" => "Testing".to_string(),
+        "review" => "Review".to_string(),
         "merge" => "Merge".to_string(),
         _ => name.to_string(),
     }
@@ -279,34 +272,21 @@ fn extract_stage_summary(stage_name: &str, logs: &[String]) -> String {
     let log_text = logs.join("\n");
 
     match stage_name {
-        "code_review" => {
+        "review" => {
             // Look for review comments or summary
             for line in logs.iter().rev() {
-                if line.contains("Code review completed")
-                    || line.contains("review completed")
+                if line.contains("Codex approval detected")
+                    || line.contains("Codex review approved")
                     || line.contains("LGTM")
                     || line.contains("looks good")
                 {
                     return line.trim().to_string();
                 }
             }
-            if log_text.contains("fix") || log_text.contains("Fix") {
-                return "Issues found and fixed during review".to_string();
+            if log_text.contains("@codex review") {
+                return "Codex review requested".to_string();
             }
-            "Code review completed".to_string()
-        }
-        "testing" => {
-            // Look for test results
-            for line in logs.iter().rev() {
-                if line.contains("tests pass")
-                    || line.contains("All tests")
-                    || line.contains("test result")
-                    || line.contains("Tests passed")
-                {
-                    return line.trim().to_string();
-                }
-            }
-            "Testing completed".to_string()
+            "Review completed".to_string()
         }
         "implement" => {
             for line in logs.iter().rev() {

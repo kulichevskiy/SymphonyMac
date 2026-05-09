@@ -27,8 +27,9 @@ export interface RunConfig {
   hooks: LifecycleHooks;
   priority_labels: string[];
   stall_timeout_secs: number;
-  stage_skip_labels: Record<string, string[]>;
   approval_gates: Record<string, boolean>;
+  codex_approve_patterns: string[];
+  codex_feedback_marker: string;
   local_repos: Record<string, string>;
   custom_agent_command: string;
 }

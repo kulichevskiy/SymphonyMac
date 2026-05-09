@@ -94,12 +94,10 @@ describe("buildDashboardColumns", () => {
         makeIssue(8),
       ],
       runs: [
-        makeRun(4, "implement", "completed", {
-          skipped_stages: ["testing"],
-        }),
-        makeRun(5, "testing", "running"),
-        makeRun(6, "code_review", "awaiting_approval", {
-          pending_next_stage: "testing",
+        makeRun(4, "implement", "completed"),
+        makeRun(5, "review", "running"),
+        makeRun(6, "review", "awaiting_approval", {
+          pending_next_stage: "merge",
         }),
         makeRun(7, "merge", "failed", {
           error: "merge conflict",
@@ -113,15 +111,14 @@ describe("buildDashboardColumns", () => {
     expect(columnItems(columns, "review")[0]).toMatchObject({
       number: 4,
       runStatus: "waiting",
-      skippedStages: ["testing"],
     });
-    expect(columnItems(columns, "testing")[0]).toMatchObject({
+    expect(columnItems(columns, "review").find((card) => card.number === 5)).toMatchObject({
       number: 5,
       runStatus: "running",
     });
     expect(columnItems(columns, "approval")[0]).toMatchObject({
       number: 6,
-      pendingNextStage: "testing",
+      pendingNextStage: "merge",
     });
     expect(columnItems(columns, "failed")[0]).toMatchObject({
       number: 7,

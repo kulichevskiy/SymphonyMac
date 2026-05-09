@@ -426,13 +426,8 @@ pub(crate) async fn run_agent_process(
         .await;
     }
 
-    let skipped_stages = {
-        let s = state.lock().await;
-        crate::orchestrator::compute_skipped_stages(
-            &request.spec.issue_labels,
-            &s.config.stage_skip_labels,
-        )
-    };
+    // No skippable stages in the new 3-stage pipeline.
+    let skipped_stages: Vec<PipelineStage> = Vec::new();
 
     let merge_verification = match request.spec.stage {
         PipelineStage::Merge => match crate::github::is_pr_merged_for_issue(
@@ -474,8 +469,12 @@ pub(crate) async fn run_agent_process(
                 runtime::append_run_log(&state, &request.run_id, message, false, true).await;
             }
 
-            let next_spec = next_stage_spec(&request.spec, next_stage, String::new(), stage_context);
-            pipeline::spawn_next_stage(app.clone(), state.clone(), next_spec);
+            let next_spec = next_stage_spec(&request.spec, next_stage.clone(), String::new(), stage_context);
+            if matches!(next_stage, PipelineStage::Review) {
+                pipeline::spawn_review_stage(app.clone(), state.clone(), next_spec);
+            } else {
+                pipeline::spawn_next_stage(app.clone(), state.clone(), next_spec);
+            }
         }
         SuccessfulStageAction::AwaitingApproval {
             next_stage,

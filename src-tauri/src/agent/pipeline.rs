@@ -180,6 +180,190 @@ pub(crate) fn spawn_next_stage(app: AppHandle, state: SharedState, spec: StageLa
     });
 }
 
+/// Spawn the Review stage: registers a Running run, posts `@codex review`,
+/// and records the request timestamp + HEAD SHA. The orchestrator's poll loop
+/// then watches for an approving Codex comment and advances to Merge.
+pub(crate) fn spawn_review_stage(app: AppHandle, state: SharedState, spec: StageLaunchSpec) {
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        if !wait_for_stage_slot(&state, &spec.stage, spec.issue_number).await {
+            return;
+        }
+
+        if should_skip_next_stage_launch(&spec).await {
+            return;
+        }
+
+        start_review_stage(&app, &state, spec).await;
+    });
+}
+
+/// Synchronous variant: prepares the Review run, marks it Running, posts the
+/// `@codex review` comment, and persists `last_review_request_at` / `last_pushed_sha`.
+pub(crate) async fn start_review_stage(
+    app: &AppHandle,
+    state: &SharedState,
+    spec: StageLaunchSpec,
+) -> Option<String> {
+    let run_id = register_review_run(app, state, &spec).await;
+
+    super::runtime::transition_run(
+        app,
+        state,
+        &run_id,
+        super::runtime::StatusTransition {
+            status: AgentStatus::Running,
+            stage_label: PipelineStage::Review.to_string(),
+            error: None,
+            finished: false,
+            log_message: Some("[review] Pinging @codex review on the PR".to_string()),
+            pending_next_stage: super::runtime::PendingNextStageUpdate::Keep,
+            emit_extra: Map::new(),
+            persist_meta: true,
+        },
+    )
+    .await;
+
+    let (pr_number, head_sha) = match resolve_pr_for_review(state, &run_id, &spec).await {
+        Some(pr) => (pr.number, pr.head_ref_oid),
+        None => return Some(run_id),
+    };
+
+    let request_timestamp = Utc::now().to_rfc3339();
+
+    if let Err(error) = crate::github::post_codex_review(&spec.repo, pr_number).await {
+        let log_message = format!("[review] Failed to post @codex review: {}", error);
+        super::runtime::append_run_log(state, &run_id, log_message.clone(), true, true).await;
+        let mut emit_extra = Map::new();
+        emit_extra.insert("error".to_string(), json!(error.clone()));
+        super::runtime::transition_run(
+            app,
+            state,
+            &run_id,
+            super::runtime::StatusTransition {
+                status: AgentStatus::Failed,
+                stage_label: PipelineStage::Review.to_string(),
+                error: Some(error),
+                finished: true,
+                log_message: None,
+                pending_next_stage: super::runtime::PendingNextStageUpdate::Keep,
+                emit_extra,
+                persist_meta: true,
+            },
+        )
+        .await;
+        return Some(run_id);
+    }
+
+    let request_ts_for_run = request_timestamp.clone();
+    let sha_for_run = head_sha.clone();
+    super::runtime::mutate_run(state, &run_id, true, move |run| {
+        run.last_review_request_at = Some(request_ts_for_run);
+        run.last_pushed_sha = sha_for_run;
+    })
+    .await;
+
+    let posted_log = format!(
+        "[review] Posted @codex review (PR #{}{}). Polling for approval.",
+        pr_number,
+        head_sha
+            .as_ref()
+            .map(|sha| format!(", PR HEAD {}", sha))
+            .unwrap_or_default(),
+    );
+    super::runtime::append_run_log(state, &run_id, posted_log, true, true).await;
+
+    Some(run_id)
+}
+
+async fn register_review_run(
+    app: &AppHandle,
+    state: &SharedState,
+    spec: &StageLaunchSpec,
+) -> String {
+    let config = {
+        let s = state.lock().await;
+        s.config.clone()
+    };
+    let run_id = Uuid::new_v4().to_string();
+    let run = AgentRun {
+        id: run_id.clone(),
+        repo: spec.repo.clone(),
+        issue_number: spec.issue_number,
+        issue_title: spec.issue_title.clone(),
+        status: AgentStatus::Preparing,
+        stage: spec.stage.clone(),
+        started_at: Utc::now().to_rfc3339(),
+        finished_at: None,
+        logs: Vec::new(),
+        workspace_path: spec.workspace_path.to_string_lossy().to_string(),
+        error: None,
+        attempt: spec.attempt,
+        max_retries: spec.max_retries,
+        lines_added: 0,
+        lines_removed: 0,
+        files_modified_list: Vec::new(),
+        report: None,
+        command_display: Some("gh pr comment <PR> --body \"@codex review\"".to_string()),
+        agent_type: config.agent_type.clone(),
+        last_log_line: None,
+        log_count: 0,
+        activity: Some("Awaiting Codex".to_string()),
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: 0.0,
+        last_log_timestamp: None,
+        issue_labels: spec.issue_labels.clone(),
+        skipped_stages: Vec::new(),
+        stage_context: spec.previous_context.clone(),
+        pending_next_stage: None,
+        last_pushed_sha: None,
+        last_review_request_at: None,
+    };
+    super::runtime::register_preparing_run(app, state, run, Map::new()).await;
+    run_id
+}
+
+async fn resolve_pr_for_review(
+    state: &SharedState,
+    run_id: &str,
+    spec: &StageLaunchSpec,
+) -> Option<crate::github::PullRequestFullState> {
+    match crate::github::pr_full_state(&spec.repo, spec.issue_number).await {
+        Ok(Some(pr)) => Some(pr),
+        Ok(None) => {
+            let error = format!(
+                "No PR found for issue #{} — cannot start Review stage.",
+                spec.issue_number
+            );
+            fail_review_run(state, run_id, error).await;
+            None
+        }
+        Err(error) => {
+            fail_review_run(state, run_id, error).await;
+            None
+        }
+    }
+}
+
+async fn fail_review_run(state: &SharedState, run_id: &str, error: String) {
+    super::runtime::append_run_log(
+        state,
+        run_id,
+        format!("[review] {}", error),
+        true,
+        true,
+    )
+    .await;
+    let _ = super::runtime::mutate_run(state, run_id, true, move |run| {
+        run.status = AgentStatus::Failed;
+        run.error = Some(error.clone());
+        run.finished_at = Some(Utc::now().to_rfc3339());
+    })
+    .await;
+}
+
 pub(crate) fn spawn_retry(
     app: AppHandle,
     state: SharedState,
@@ -287,9 +471,7 @@ fn prepare_stage_run(config: &RunConfig, spec: StageLaunchSpec) -> PreparedStage
     );
     let (command, args) = build_command_args(config, &prompt);
     let command_display = format_command_display(&command, &args);
-    let skipped =
-        crate::orchestrator::compute_skipped_stages(&spec.issue_labels, &config.stage_skip_labels);
-    let skipped_stage_names: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+    let skipped_stage_names: Vec<String> = Vec::new();
 
     let mut logs = Vec::new();
     if spec.attempt > 1 {
@@ -332,6 +514,8 @@ fn prepare_stage_run(config: &RunConfig, spec: StageLaunchSpec) -> PreparedStage
         skipped_stages: skipped_stage_names,
         stage_context: None,
         pending_next_stage: None,
+        last_pushed_sha: None,
+        last_review_request_at: None,
     };
 
     let request = AgentProcessRequest {
@@ -345,21 +529,11 @@ fn prepare_stage_run(config: &RunConfig, spec: StageLaunchSpec) -> PreparedStage
 }
 
 fn skipped_stage_logs(
-    current_stage: &PipelineStage,
-    next_stage: &PipelineStage,
-    skipped_stages: &[PipelineStage],
+    _current_stage: &PipelineStage,
+    _next_stage: &PipelineStage,
+    _skipped_stages: &[PipelineStage],
 ) -> Vec<String> {
-    let default_chain: &[PipelineStage] = match current_stage {
-        PipelineStage::Implement => &[PipelineStage::CodeReview, PipelineStage::Testing],
-        PipelineStage::CodeReview => &[PipelineStage::Testing],
-        _ => &[],
-    };
-
-    default_chain
-        .iter()
-        .filter(|stage| skipped_stages.contains(stage) && *stage != next_stage)
-        .map(|stage| format!("[pipeline] Skipping {} stage (label rule)", stage))
-        .collect()
+    Vec::new()
 }
 
 async fn wait_for_stage_slot(
@@ -440,7 +614,7 @@ async fn collect_latest_stage_runs(
     issue_number: u64,
 ) -> Vec<AgentRun> {
     let s = state.lock().await;
-    let stage_order = ["implement", "code_review", "testing", "merge"];
+    let stage_order = ["implement", "review", "merge"];
 
     stage_order
         .iter()
@@ -488,7 +662,7 @@ fn build_done_run(
 ) -> (AgentRun, crate::report::PipelineReport) {
     let done_id = Uuid::new_v4().to_string();
     let mut aggregated_logs = Vec::new();
-    let stage_order = ["implement", "code_review", "testing", "merge"];
+    let stage_order = ["implement", "review", "merge"];
 
     for stage_name in &stage_order {
         if let Some(run) = stage_runs
@@ -548,6 +722,8 @@ fn build_done_run(
             .collect(),
         stage_context: None,
         pending_next_stage: None,
+        last_pushed_sha: None,
+        last_review_request_at: None,
     };
 
     (done_run, pipeline_report)
@@ -637,48 +813,22 @@ fn build_stage_summary(stage: &PipelineStage, logs: &[String]) -> String {
                 commits.into_iter().take(3).collect::<Vec<_>>().join("; ")
             }
         }
-        PipelineStage::CodeReview => {
+        PipelineStage::Review => {
             let mut findings = Vec::new();
             for line in logs {
                 let lower = line.to_lowercase();
-                if lower.contains("issue")
-                    || lower.contains("fix")
-                    || lower.contains("bug")
-                    || lower.contains("suggestion")
-                    || lower.contains("approved")
+                if lower.contains("approved")
                     || lower.contains("review completed")
+                    || lower.contains("codex")
+                    || lower.contains("@codex review")
                 {
                     findings.push(line.chars().take(100).collect::<String>());
                 }
             }
             if findings.is_empty() {
-                "Code review completed.".to_string()
+                "Review completed.".to_string()
             } else {
                 findings.into_iter().take(3).collect::<Vec<_>>().join("; ")
-            }
-        }
-        PipelineStage::Testing => {
-            let mut results = Vec::new();
-            for line in logs {
-                let lower = line.to_lowercase();
-                if lower.contains("pass")
-                    || lower.contains("fail")
-                    || lower.contains("test")
-                    || lower.contains("error")
-                    || lower.contains("ok")
-                {
-                    results.push(line.chars().take(100).collect::<String>());
-                }
-            }
-            if results.is_empty() {
-                "Testing completed.".to_string()
-            } else {
-                results
-                    .into_iter()
-                    .rev()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join("; ")
             }
         }
         _ => String::new(),
@@ -734,14 +884,16 @@ mod tests {
             skipped_stages: Vec::new(),
             stage_context: None,
             pending_next_stage: None,
+            last_pushed_sha: None,
+            last_review_request_at: None,
         }
     }
 
     #[test]
-    fn implementation_can_skip_review_and_advance_to_testing() {
+    fn implement_advances_to_review_in_three_stage_pipeline() {
         let action = decide_successful_stage_action(
             &PipelineStage::Implement,
-            &[PipelineStage::CodeReview],
+            &[],
             false,
             MergeVerification::NotRequired,
         );
@@ -749,8 +901,26 @@ mod tests {
         assert_eq!(
             action,
             SuccessfulStageAction::Advance {
-                next_stage: PipelineStage::Testing,
-                skipped_logs: vec!["[pipeline] Skipping code_review stage (label rule)".to_string()],
+                next_stage: PipelineStage::Review,
+                skipped_logs: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn review_advances_to_merge_in_three_stage_pipeline() {
+        let action = decide_successful_stage_action(
+            &PipelineStage::Review,
+            &[],
+            false,
+            MergeVerification::NotRequired,
+        );
+
+        assert_eq!(
+            action,
+            SuccessfulStageAction::Advance {
+                next_stage: PipelineStage::Merge,
+                skipped_logs: Vec::new(),
             }
         );
     }
@@ -758,7 +928,7 @@ mod tests {
     #[test]
     fn approval_gate_pauses_after_successful_stage() {
         let action = decide_successful_stage_action(
-            &PipelineStage::CodeReview,
+            &PipelineStage::Review,
             &[],
             true,
             MergeVerification::NotRequired,
@@ -767,7 +937,7 @@ mod tests {
         assert_eq!(
             action,
             SuccessfulStageAction::AwaitingApproval {
-                next_stage: PipelineStage::Testing,
+                next_stage: PipelineStage::Merge,
                 skipped_logs: Vec::new(),
             }
         );
@@ -873,8 +1043,8 @@ mod tests {
                 2.25,
             ),
             sample_run(
-                "testing",
-                PipelineStage::Testing,
+                "review",
+                PipelineStage::Review,
                 "2026-03-08T10:10:00Z",
                 30,
                 15,
@@ -911,7 +1081,7 @@ mod tests {
             issue_title: "Split agent.rs".to_string(),
             workspace_path: PathBuf::from("/tmp/workspace"),
             issue_labels: vec!["refactor".to_string()],
-            skipped_stages: vec![PipelineStage::CodeReview],
+            skipped_stages: Vec::new(),
         };
         let latest_stage_runs = vec![
             sample_run(
@@ -923,8 +1093,8 @@ mod tests {
                 2.25,
             ),
             sample_run(
-                "testing",
-                PipelineStage::Testing,
+                "review",
+                PipelineStage::Review,
                 "2026-03-08T10:10:00Z",
                 30,
                 15,
@@ -945,7 +1115,7 @@ mod tests {
         assert_eq!(done_run.input_tokens, 380);
         assert_eq!(done_run.output_tokens, 145);
         assert_eq!(done_run.cost_usd, 4.25);
-        assert_eq!(done_run.skipped_stages, vec!["code_review".to_string()]);
+        assert!(done_run.skipped_stages.is_empty());
     }
 
     #[test]
@@ -990,6 +1160,8 @@ mod tests {
             skipped_stages: vec![],
             stage_context: None,
             pending_next_stage: None,
+            last_pushed_sha: None,
+            last_review_request_at: None,
         };
 
         let context = extract_stage_context(&run, "pedrocid/SymphonyMac");
