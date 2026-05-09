@@ -647,6 +647,232 @@ fn select_pr_full_state(
     None
 }
 
+/// Normalized state of a single CI check on a PR.
+///
+/// `gh pr view --json statusCheckRollup` returns two distinct shapes — `CheckRun`
+/// (Actions) carries `status` + `conclusion`, while `StatusContext` (external CI)
+/// carries `state`. This enum collapses both into the four buckets the orchestrator
+/// actually cares about, so callers don't have to re-do that normalization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    /// Completed successfully, or treated-as-success (skipped, neutral, stale).
+    Success,
+    /// Completed and failed (FAILURE / TIMED_OUT / CANCELLED / ACTION_REQUIRED / STARTUP_FAILURE).
+    Failure,
+    /// Errored (typically a `StatusContext` with state == ERROR).
+    Error,
+    /// Still running, queued, or otherwise not yet a terminal verdict.
+    Pending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrCheck {
+    pub name: String,
+    pub state: CheckState,
+    pub is_required: bool,
+    /// GitHub Actions workflow run id, if this check is a CheckRun whose
+    /// detailsUrl looks like `.../actions/runs/<id>/...`. Used for
+    /// `gh run view <id> --log-failed`.
+    pub run_id: Option<String>,
+    pub details_url: Option<String>,
+}
+
+/// Aggregated CI status for a PR: just a flat list of normalized checks.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PrCiStatus {
+    pub checks: Vec<PrCheck>,
+}
+
+impl PrCiStatus {
+    /// "CI green" definition (per issue #4):
+    /// - All required checks are SUCCESS.
+    /// - No check (required or not) is FAILURE / ERROR.
+    /// - Non-required PENDING is ignored.
+    /// - Required PENDING blocks (we wait, not green yet).
+    /// - Zero checks → green.
+    pub fn is_green(&self) -> bool {
+        if self.checks.iter().any(|check| {
+            matches!(check.state, CheckState::Failure | CheckState::Error)
+        }) {
+            return false;
+        }
+        self.checks
+            .iter()
+            .filter(|check| check.is_required)
+            .all(|check| check.state == CheckState::Success)
+    }
+
+    /// Checks currently in FAILURE or ERROR — the set we'd surface to a fix-run.
+    pub fn failing_checks(&self) -> Vec<&PrCheck> {
+        self.checks
+            .iter()
+            .filter(|check| matches!(check.state, CheckState::Failure | CheckState::Error))
+            .collect()
+    }
+
+    /// True when at least one *required* check is still PENDING. Useful for
+    /// distinguishing the "approved but CI not yet finished" case from the
+    /// "approved and CI failed" case in callers' log lines and approval
+    /// dispositions. Not used in `is_green()` itself — kept as a separate
+    /// predicate so consumers can act on partial CI state.
+    #[allow(dead_code)]
+    pub fn has_pending_required(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.is_required && check.state == CheckState::Pending)
+    }
+}
+
+/// Fetch the structured CI status for `pr_number` on `repo` via
+/// `gh pr view --json statusCheckRollup`.
+pub async fn pr_ci_status(repo: &str, pr_number: u64) -> Result<PrCiStatus, String> {
+    let pr_number_str = pr_number.to_string();
+    let output = run_gh(&[
+        "pr",
+        "view",
+        &pr_number_str,
+        "-R",
+        repo,
+        "--json",
+        "statusCheckRollup",
+    ])
+    .await?;
+    let value: serde_json::Value = serde_json::from_str(&output)
+        .map_err(|e| format!("Failed to parse PR status JSON: {}", e))?;
+    Ok(parse_status_check_rollup(&value["statusCheckRollup"]))
+}
+
+/// Best-effort fetch of the failure log for a GitHub Actions run, capped at
+/// `max_chars` so we don't blow up the agent prompt. Returns `None` when the
+/// `gh run view` command fails for any reason — we surface the check name and
+/// state regardless, so a missing log shouldn't block the fix-run.
+pub async fn run_failure_log_excerpt(
+    repo: &str,
+    run_id: &str,
+    max_chars: usize,
+) -> Option<String> {
+    let output = Command::new(crate::paths::resolve("gh"))
+        .env("PATH", crate::paths::build_path_env())
+        .args(["run", "view", run_id, "-R", repo, "--log-failed"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(trimmed, max_chars))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("\n…[truncated]");
+    out
+}
+
+fn parse_status_check_rollup(rollup: &serde_json::Value) -> PrCiStatus {
+    let Some(items) = rollup.as_array() else {
+        return PrCiStatus::default();
+    };
+    let checks = items.iter().filter_map(parse_pr_check).collect();
+    PrCiStatus { checks }
+}
+
+fn parse_pr_check(item: &serde_json::Value) -> Option<PrCheck> {
+    let typename = item["__typename"].as_str().unwrap_or("");
+    let is_required = item["isRequired"].as_bool().unwrap_or(false);
+
+    match typename {
+        "CheckRun" => {
+            let name = item["name"].as_str().unwrap_or("").to_string();
+            let status = item["status"].as_str().unwrap_or("");
+            let conclusion = item["conclusion"].as_str().unwrap_or("");
+            let state = normalize_check_run_state(status, conclusion);
+            let details_url = item["detailsUrl"].as_str().map(|s| s.to_string());
+            let run_id = details_url.as_deref().and_then(parse_actions_run_id);
+            Some(PrCheck {
+                name,
+                state,
+                is_required,
+                run_id,
+                details_url,
+            })
+        }
+        "StatusContext" => {
+            let name = item["context"].as_str().unwrap_or("").to_string();
+            let state_str = item["state"].as_str().unwrap_or("");
+            let state = normalize_status_context_state(state_str);
+            let details_url = item["targetUrl"].as_str().map(|s| s.to_string());
+            Some(PrCheck {
+                name,
+                state,
+                is_required,
+                run_id: None,
+                details_url,
+            })
+        }
+        // Defensive: GitHub adds new __typename values periodically. Skip
+        // unknown shapes rather than misclassify them.
+        _ => None,
+    }
+}
+
+/// Map a GitHub Actions `CheckRun` (status + conclusion) onto our 4-state enum.
+///
+/// Status drives the verdict only when the run hasn't completed; once it's
+/// COMPLETED we read the conclusion. We treat skipped/neutral/stale as success
+/// (they don't block — that matches GitHub's own "checks passed" UI).
+fn normalize_check_run_state(status: &str, conclusion: &str) -> CheckState {
+    let status_upper = status.to_ascii_uppercase();
+    if status_upper != "COMPLETED" {
+        return CheckState::Pending;
+    }
+    match conclusion.to_ascii_uppercase().as_str() {
+        "SUCCESS" => CheckState::Success,
+        "NEUTRAL" | "SKIPPED" | "STALE" => CheckState::Success,
+        "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => {
+            CheckState::Failure
+        }
+        // Unknown / empty conclusion on a COMPLETED run — treat as pending so
+        // we don't silently advance on a check we can't interpret.
+        _ => CheckState::Pending,
+    }
+}
+
+fn normalize_status_context_state(state: &str) -> CheckState {
+    match state.to_ascii_uppercase().as_str() {
+        "SUCCESS" => CheckState::Success,
+        "FAILURE" => CheckState::Failure,
+        "ERROR" => CheckState::Error,
+        "PENDING" | "EXPECTED" => CheckState::Pending,
+        // Unknown — bias toward Pending; we'd rather wait than misreport green.
+        _ => CheckState::Pending,
+    }
+}
+
+/// Pull the workflow-run id out of an Actions detailsUrl, e.g.
+/// `https://github.com/owner/repo/actions/runs/123456789/job/987` → `123456789`.
+/// Returns `None` for any URL that doesn't follow that pattern.
+fn parse_actions_run_id(url: &str) -> Option<String> {
+    let marker = "/actions/runs/";
+    let position = url.find(marker)?;
+    let after = &url[position + marker.len()..];
+    let id: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 /// Post `@codex review` as an issue-level comment on the given PR.
 pub async fn post_codex_review(repo: &str, pr_number: u64) -> Result<(), String> {
     let pr_number_str = pr_number.to_string();
@@ -965,6 +1191,249 @@ mod tests {
         ]);
         let prs_array = prs.as_array().unwrap();
         assert!(select_pr_full_state(prs_array, 42).is_none());
+    }
+
+    fn check(name: &str, state: CheckState, is_required: bool) -> PrCheck {
+        PrCheck {
+            name: name.to_string(),
+            state,
+            is_required,
+            run_id: None,
+            details_url: None,
+        }
+    }
+
+    #[test]
+    fn pr_ci_status_is_green_when_no_checks_exist() {
+        let status = PrCiStatus::default();
+        assert!(status.is_green());
+        assert!(status.failing_checks().is_empty());
+        assert!(!status.has_pending_required());
+    }
+
+    #[test]
+    fn pr_ci_status_is_green_when_all_required_succeed_and_nothing_is_failing() {
+        // Mixed required/non-required checks where every required one is green
+        // and no check failed. A non-required PENDING is allowed by spec.
+        let status = PrCiStatus {
+            checks: vec![
+                check("build", CheckState::Success, true),
+                check("test", CheckState::Success, true),
+                check("lint", CheckState::Pending, false),
+            ],
+        };
+        assert!(status.is_green());
+    }
+
+    #[test]
+    fn pr_ci_status_is_not_green_when_required_check_is_pending() {
+        // Required PENDING blocks merge — we wait for it to settle before
+        // declaring CI green.
+        let status = PrCiStatus {
+            checks: vec![
+                check("build", CheckState::Success, true),
+                check("test", CheckState::Pending, true),
+            ],
+        };
+        assert!(!status.is_green());
+        assert!(status.has_pending_required());
+        assert!(status.failing_checks().is_empty());
+    }
+
+    #[test]
+    fn pr_ci_status_is_not_green_when_any_check_failed_even_if_not_required() {
+        // Spec: "No checks in state FAILURE or ERROR (even non-required)."
+        let status = PrCiStatus {
+            checks: vec![
+                check("build", CheckState::Success, true),
+                check("optional-smoke", CheckState::Failure, false),
+            ],
+        };
+        assert!(!status.is_green());
+        assert_eq!(status.failing_checks().len(), 1);
+        assert_eq!(status.failing_checks()[0].name, "optional-smoke");
+    }
+
+    #[test]
+    fn pr_ci_status_failing_checks_includes_both_failure_and_error_states() {
+        let status = PrCiStatus {
+            checks: vec![
+                check("ci/jenkins", CheckState::Error, false),
+                check("test", CheckState::Failure, true),
+                check("lint", CheckState::Success, true),
+                check("docs", CheckState::Pending, false),
+            ],
+        };
+        assert!(!status.is_green());
+        let failing: Vec<&str> = status
+            .failing_checks()
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(failing, vec!["ci/jenkins", "test"]);
+    }
+
+    #[test]
+    fn parse_status_check_rollup_handles_check_run_and_status_context_shapes() {
+        let rollup = serde_json::json!([
+            {
+                "__typename": "CheckRun",
+                "name": "build",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "isRequired": true,
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/9876543/job/111"
+            },
+            {
+                "__typename": "CheckRun",
+                "name": "flaky-test",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "isRequired": false,
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/9876544/job/222"
+            },
+            {
+                "__typename": "CheckRun",
+                "name": "long-running",
+                "status": "IN_PROGRESS",
+                "conclusion": null,
+                "isRequired": true,
+                "detailsUrl": null
+            },
+            {
+                "__typename": "StatusContext",
+                "context": "ci/jenkins",
+                "state": "ERROR",
+                "isRequired": true,
+                "targetUrl": "https://jenkins.example.com/job/ci"
+            },
+            {
+                "__typename": "Unknown",
+                "name": "future-shape"
+            }
+        ]);
+        let status = parse_status_check_rollup(&rollup);
+        assert_eq!(status.checks.len(), 4, "unknown __typename must be skipped");
+
+        let by_name: std::collections::HashMap<&str, &PrCheck> = status
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c))
+            .collect();
+
+        assert_eq!(by_name["build"].state, CheckState::Success);
+        assert_eq!(by_name["build"].run_id.as_deref(), Some("9876543"));
+        assert!(by_name["build"].is_required);
+
+        assert_eq!(by_name["flaky-test"].state, CheckState::Failure);
+        assert!(!by_name["flaky-test"].is_required);
+        assert_eq!(by_name["flaky-test"].run_id.as_deref(), Some("9876544"));
+
+        assert_eq!(by_name["long-running"].state, CheckState::Pending);
+        assert!(by_name["long-running"].is_required);
+        assert!(by_name["long-running"].run_id.is_none());
+
+        assert_eq!(by_name["ci/jenkins"].state, CheckState::Error);
+        assert!(by_name["ci/jenkins"].run_id.is_none());
+    }
+
+    #[test]
+    fn parse_status_check_rollup_returns_empty_for_pr_with_no_checks() {
+        // Spec: "Repo with zero checks → green." Verify the parse step gives us
+        // an empty list, which is_green() then accepts.
+        let empty = serde_json::json!([]);
+        let status = parse_status_check_rollup(&empty);
+        assert!(status.checks.is_empty());
+        assert!(status.is_green());
+    }
+
+    #[test]
+    fn normalize_check_run_state_treats_neutral_and_skipped_as_success() {
+        // GitHub's "checks passed" UI considers these non-blocking; mirror that
+        // so a Skipped non-required check doesn't keep us out of Merge.
+        assert_eq!(
+            normalize_check_run_state("COMPLETED", "NEUTRAL"),
+            CheckState::Success
+        );
+        assert_eq!(
+            normalize_check_run_state("COMPLETED", "SKIPPED"),
+            CheckState::Success
+        );
+        assert_eq!(
+            normalize_check_run_state("COMPLETED", "STALE"),
+            CheckState::Success
+        );
+    }
+
+    #[test]
+    fn normalize_check_run_state_groups_terminal_failure_modes() {
+        for conclusion in [
+            "FAILURE",
+            "TIMED_OUT",
+            "CANCELLED",
+            "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+        ] {
+            assert_eq!(
+                normalize_check_run_state("COMPLETED", conclusion),
+                CheckState::Failure,
+                "{conclusion} should map to Failure"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_check_run_state_in_progress_is_pending_regardless_of_conclusion() {
+        // GitHub sometimes leaves a stale conclusion field on an in-progress run.
+        // Status drives the verdict until the run is COMPLETED.
+        assert_eq!(
+            normalize_check_run_state("IN_PROGRESS", "SUCCESS"),
+            CheckState::Pending
+        );
+        assert_eq!(
+            normalize_check_run_state("QUEUED", ""),
+            CheckState::Pending
+        );
+    }
+
+    #[test]
+    fn normalize_status_context_state_distinguishes_failure_from_error() {
+        assert_eq!(normalize_status_context_state("SUCCESS"), CheckState::Success);
+        assert_eq!(normalize_status_context_state("FAILURE"), CheckState::Failure);
+        assert_eq!(normalize_status_context_state("ERROR"), CheckState::Error);
+        assert_eq!(normalize_status_context_state("PENDING"), CheckState::Pending);
+        assert_eq!(normalize_status_context_state("EXPECTED"), CheckState::Pending);
+        // Unknown -> Pending (don't pretend success).
+        assert_eq!(normalize_status_context_state("WAT"), CheckState::Pending);
+    }
+
+    #[test]
+    fn parse_actions_run_id_extracts_id_from_canonical_actions_url() {
+        assert_eq!(
+            parse_actions_run_id("https://github.com/owner/repo/actions/runs/123456789/job/987"),
+            Some("123456789".to_string())
+        );
+        assert_eq!(
+            parse_actions_run_id("https://github.com/owner/repo/actions/runs/42"),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_actions_run_id_returns_none_for_non_actions_urls() {
+        assert!(parse_actions_run_id("https://jenkins.example.com/job/ci").is_none());
+        assert!(parse_actions_run_id("").is_none());
+        assert!(parse_actions_run_id("https://github.com/owner/repo/actions/runs/abc").is_none());
+    }
+
+    #[test]
+    fn truncate_chars_keeps_short_inputs_intact_and_truncates_long_ones() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        // Boundary case: exact length should not be truncated.
+        assert_eq!(truncate_chars("hello", 5), "hello");
+        let truncated = truncate_chars("abcdefghij", 4);
+        assert!(truncated.starts_with("abcd"));
+        assert!(truncated.contains("[truncated]"));
     }
 
     #[test]

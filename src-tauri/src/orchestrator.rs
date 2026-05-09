@@ -204,6 +204,13 @@ pub struct AgentRun {
     /// Starts at 0 (no feedback received yet); incremented before each fix-run is spawned.
     #[serde(default)]
     pub review_iteration: u32,
+    /// The PR HEAD SHA we most recently spawned a CI-failure fix-run against.
+    /// Used by the review-poll loop to dedupe: once a fix-run is in flight for
+    /// SHA X's failing checks, don't spawn another for the same SHA. When the
+    /// fix-run pushes a new SHA, this no longer matches and the next failure
+    /// (if any) on the new SHA can trigger a fresh fix-run.
+    #[serde(default)]
+    pub last_ci_failure_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -957,6 +964,7 @@ mod tests {
             last_pushed_sha: None,
             last_review_request_at: None,
             review_iteration: 0,
+            last_ci_failure_sha: None,
         }
     }
 
@@ -1055,6 +1063,7 @@ mod tests {
             last_pushed_sha: None,
             last_review_request_at: None,
             review_iteration: 0,
+            last_ci_failure_sha: None,
         }
     }
 

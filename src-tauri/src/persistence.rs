@@ -240,6 +240,7 @@ mod tests {
             last_pushed_sha: None,
             last_review_request_at: None,
             review_iteration: 0,
+            last_ci_failure_sha: None,
         }
     }
 

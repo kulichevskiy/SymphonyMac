@@ -343,6 +343,7 @@ async fn register_review_run(
         last_pushed_sha: None,
         last_review_request_at: None,
         review_iteration: 0,
+        last_ci_failure_sha: None,
     };
     super::runtime::register_preparing_run(app, state, run, Map::new()).await;
     run_id
@@ -370,13 +371,20 @@ async fn resolve_pr_for_review(
     }
 }
 
-/// Per-kind payload for a fix-run spawn. `Feedback` carries the formatted
-/// Codex comments to forward to the agent; `Rebase` carries the conflict
-/// context the agent needs to know how to rebase.
+/// Per-kind payload for a fix-run spawn. `Feedback` carries the actionable
+/// signals coming back from the PR — verbatim Codex comments and/or failing
+/// CI checks. `Rebase` carries the conflict context the agent needs to know
+/// how to rebase.
+///
+/// Both `feedback` and `ci_failures` on the `Feedback` variant are optional
+/// independently — the orchestrator's review poll reaches the spawn path
+/// when at least one is non-empty. The prompt builder omits the section it
+/// has nothing to render.
 #[derive(Debug, Clone)]
 pub(crate) enum FixRunPayload {
     Feedback {
         feedback: String,
+        ci_failures: Vec<super::prompt::CiFailureContext>,
     },
     Rebase {
         base_branch: String,
@@ -396,6 +404,11 @@ impl FixRunPayload {
 /// Snapshot of the Review run + its open PR captured under-lock for the
 /// fix-run dispatcher. Carries everything the spawn function needs without
 /// re-acquiring the state lock or re-querying GitHub.
+///
+/// At least one of `feedback` (Codex review feedback) and `ci_failures` (failed
+/// CI checks) must be non-empty — the orchestrator's review-poll loop only
+/// reaches the spawn path when there's something to fix. Both can coexist:
+/// e.g. Codex left feedback AND a workflow failed on the same SHA.
 #[derive(Debug, Clone)]
 pub(crate) struct FixRunSnapshot {
     pub run_id: String,
@@ -427,7 +440,10 @@ pub(crate) fn spawn_fix_run(app: AppHandle, state: SharedState, snapshot: FixRun
 
         let kind = snapshot.payload.kind();
         let (prompt, activity) = match &snapshot.payload {
-            FixRunPayload::Feedback { feedback } => (
+            FixRunPayload::Feedback {
+                feedback,
+                ci_failures,
+            } => (
                 super::prompt::build_fix_run_prompt(
                     snapshot.issue_number,
                     &snapshot.repo,
@@ -435,8 +451,16 @@ pub(crate) fn spawn_fix_run(app: AppHandle, state: SharedState, snapshot: FixRun
                     snapshot.pr_number,
                     &snapshot.branch_name,
                     feedback,
+                    ci_failures,
                 ),
-                "Applying Codex feedback",
+                // Activity label distinguishes "Codex told me to" from "CI is
+                // red" so the kanban view shows operators what the agent is
+                // actually responding to.
+                match (!feedback.trim().is_empty(), !ci_failures.is_empty()) {
+                    (true, true) => "Applying Codex feedback + CI fixes",
+                    (false, true) => "Fixing CI failures",
+                    _ => "Applying Codex feedback",
+                },
             ),
             FixRunPayload::Rebase {
                 base_branch,
@@ -458,7 +482,9 @@ pub(crate) fn spawn_fix_run(app: AppHandle, state: SharedState, snapshot: FixRun
         let command_display = format_command_display(&command, &args);
 
         // Reflect the fix-run command + activity on the Review run so the UI
-        // shows what's happening while the subprocess executes.
+        // shows what's happening while the subprocess executes. The activity
+        // label distinguishes "Codex told me to" from "CI is red" so the kanban
+        // view shows operators what the agent is actually responding to.
         let new_command_display = command_display.clone();
         let activity_label = activity.to_string();
         let _ = super::runtime::mutate_run(&state, &snapshot.run_id, true, move |run| {
@@ -974,6 +1000,7 @@ fn prepare_stage_run(config: &RunConfig, spec: StageLaunchSpec) -> PreparedStage
         last_pushed_sha: None,
         last_review_request_at: None,
         review_iteration: 0,
+        last_ci_failure_sha: None,
     };
 
     let request = AgentProcessRequest {
@@ -1183,6 +1210,7 @@ fn build_done_run(
         last_pushed_sha: None,
         last_review_request_at: None,
         review_iteration: 0,
+        last_ci_failure_sha: None,
     };
 
     (done_run, pipeline_report)
@@ -1347,6 +1375,7 @@ mod tests {
             last_pushed_sha: None,
             last_review_request_at: None,
             review_iteration: 0,
+            last_ci_failure_sha: None,
         }
     }
 
@@ -1624,6 +1653,7 @@ mod tests {
             last_pushed_sha: None,
             last_review_request_at: None,
             review_iteration: 0,
+            last_ci_failure_sha: None,
         };
 
         let context = extract_stage_context(&run, "pedrocid/SymphonyMac");
@@ -1705,7 +1735,8 @@ UD src/c.rs\n\
         use super::{FixRunKind, FixRunPayload};
         assert_eq!(
             FixRunPayload::Feedback {
-                feedback: "x".into()
+                feedback: "x".into(),
+                ci_failures: Vec::new(),
             }
             .kind(),
             FixRunKind::Feedback,

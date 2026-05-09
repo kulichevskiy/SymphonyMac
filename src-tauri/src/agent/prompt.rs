@@ -110,13 +110,31 @@ exit with a non-zero exit code so the pipeline knows the merge did not succeed."
 /// prompt builder can swap in the TDD-reinforcement variant.
 pub(crate) const RED_GATE_RETRY_MARKER: &str = "[red-gate-failure]";
 
-/// Build the prompt for a Review-stage fix-run: the agent operates in the
-/// existing PR worktree, pulls the latest commits, addresses the verbatim
-/// Codex feedback, commits, and force-pushes with `--force-with-lease`.
+/// One failing CI check, in the shape the fix-run prompt expects. A `Vec` of
+/// these is rendered into the prompt's CI-failure section.
+#[derive(Debug, Clone)]
+pub(crate) struct CiFailureContext {
+    pub name: String,
+    /// Human-readable verdict (e.g. "FAILURE", "ERROR", "TIMED_OUT") — surfaced
+    /// to the agent as-is so it can distinguish a hard failure from a timeout.
+    pub state: String,
+    /// Best-effort excerpt of the failed run's logs. May be `None` when the
+    /// check has no associated GitHub Actions run id (external CI) or when
+    /// `gh run view` failed.
+    pub log_excerpt: Option<String>,
+    pub details_url: Option<String>,
+}
+
+/// Build the prompt for a Review-stage fix-run.
 ///
-/// `feedback` is the raw, joined Codex review comments newer than the run's
-/// `last_review_request_at`. We pass them through verbatim so the agent reads
-/// the same words Codex wrote.
+/// Either or both of `feedback` (verbatim Codex review comments) and
+/// `ci_failures` (failed CI checks) may be present — the prompt only renders
+/// the sections that have content. The caller (`orchestrator::review`)
+/// guarantees at least one is non-empty before spawning a fix-run.
+///
+/// The agent operates in the existing PR worktree, pulls the latest commits,
+/// addresses each surfaced concern, commits, and force-pushes with
+/// `--force-with-lease`.
 pub(crate) fn build_fix_run_prompt(
     issue_number: u64,
     repo: &str,
@@ -124,36 +142,85 @@ pub(crate) fn build_fix_run_prompt(
     pr_number: u64,
     branch_name: &str,
     feedback: &str,
+    ci_failures: &[CiFailureContext],
 ) -> String {
+    let codex_section = if feedback.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nCodex left this feedback (verbatim, all comments since the last review request):\n\n---\n{feedback}\n---\n"
+        )
+    };
+
+    let ci_section = if ci_failures.is_empty() {
+        String::new()
+    } else {
+        let mut buf = String::from("\nCI is failing on this PR. The orchestrator will not advance to Merge until CI is green. Failed checks:\n");
+        for (index, check) in ci_failures.iter().enumerate() {
+            buf.push_str(&format!(
+                "\n--- Check {} ---\nName: {}\nState: {}\n",
+                index + 1,
+                check.name,
+                check.state
+            ));
+            if let Some(url) = check.details_url.as_deref() {
+                buf.push_str(&format!("Details URL: {}\n", url));
+            }
+            match check.log_excerpt.as_deref() {
+                Some(log) => {
+                    buf.push_str("Log excerpt:\n");
+                    buf.push_str(log);
+                    if !log.ends_with('\n') {
+                        buf.push('\n');
+                    }
+                }
+                None => {
+                    buf.push_str(
+                        "Log excerpt: (unavailable — open the details URL above to inspect manually)\n",
+                    );
+                }
+            }
+        }
+        buf
+    };
+
+    let intent = match (!feedback.trim().is_empty(), !ci_failures.is_empty()) {
+        (true, true) => "addressing Codex review feedback and CI failures",
+        (true, false) => "addressing Codex review feedback",
+        (false, true) => "fixing CI failures",
+        // `orchestrator::review` only reaches the spawn path with at least one
+        // signal present, so this branch is unreachable in practice. Provide a
+        // safe default rather than panicking.
+        (false, false) => "fixing the open PR",
+    };
+
     format!(
         "\
-You are addressing Codex review feedback on Pull Request #{pr_number} in repository {repo}.
+You are {intent} on Pull Request #{pr_number} in repository {repo}.
 
 Issue: #{issue_number} — {issue_title}
 Branch: {branch_name}
 
 You are running INSIDE the existing PR worktree. Do NOT clone, do NOT switch branches, \
 do NOT touch unrelated history.
-
-Codex left this feedback (verbatim, all comments since the last review request):
-
----
-{feedback}
----
-
+{codex_section}{ci_section}
 What to do:
 
 1. Sync the branch with the latest remote state:
    git pull --rebase
-2. Read the feedback carefully and decide for each point whether it is a valid concern \
+2. For Codex feedback (if present): decide for each point whether it is a valid concern \
 or a misunderstanding.
    - For valid concerns: fix them in the smallest scope possible. No drive-by refactors, \
 no unrelated cleanup.
    - For points you genuinely disagree with: leave the code alone (the orchestrator will \
 re-request a Codex review after you push, so Codex can revisit).
-3. Commit your fixes with a descriptive message. Do NOT amend or squash existing commits — \
+3. For CI failures (if present): read the log excerpts above and fix the underlying \
+issue. If the log excerpt is missing, run the failing check locally to reproduce, then \
+fix it. Do NOT skip, disable, or weaken the failing test/check unless it is genuinely \
+broken — fix the actual problem.
+4. Commit your fixes with a descriptive message. Do NOT amend or squash existing commits — \
 add new ones on top.
-4. Force-push the updated branch:
+5. Force-push the updated branch:
    git push --force-with-lease
 
 Hard rules:
@@ -161,8 +228,8 @@ Hard rules:
 - Do NOT close or reopen the PR.
 - Do NOT comment on the PR yourself — the orchestrator handles re-requesting a review.
 - Do NOT run `gh pr merge` — merging is a later pipeline stage.
-- If the feedback is empty, ambiguous, or you cannot make progress, exit non-zero so the \
-pipeline marks this fix-run as failed instead of pretending to succeed."
+- If you cannot make progress on any surfaced concern, exit non-zero so the pipeline \
+marks this fix-run as failed instead of pretending to succeed."
     )
 }
 
@@ -709,6 +776,98 @@ mod tests {
             args,
             vec!["--model", "gpt-4.1 mini", "--profile", "team one", "do something"]
         );
+    }
+
+    #[test]
+    fn build_fix_run_prompt_codex_only_omits_ci_section() {
+        let prompt = super::build_fix_run_prompt(
+            7,
+            "kulichevskiy/SymphonyMac",
+            "Add CI gating",
+            91,
+            "claude/issue-7",
+            "Codex says X is wrong",
+            &[],
+        );
+
+        // Codex feedback section is rendered verbatim under its header.
+        assert!(prompt.contains("Codex left this feedback"));
+        assert!(prompt.contains("Codex says X is wrong"));
+        // CI section is suppressed when there are no failing checks.
+        assert!(!prompt.contains("CI is failing"));
+        // Intent line tells the agent it's only Codex feedback.
+        assert!(prompt.contains("addressing Codex review feedback"));
+    }
+
+    #[test]
+    fn build_fix_run_prompt_ci_only_omits_codex_section_and_renders_each_failed_check() {
+        let failures = vec![
+            super::CiFailureContext {
+                name: "build".to_string(),
+                state: "FAILURE".to_string(),
+                log_excerpt: Some("error[E0382]: borrow of moved value".to_string()),
+                details_url: Some(
+                    "https://github.com/owner/repo/actions/runs/9999/job/1".to_string(),
+                ),
+            },
+            super::CiFailureContext {
+                name: "ci/jenkins".to_string(),
+                state: "ERROR".to_string(),
+                log_excerpt: None,
+                details_url: Some("https://jenkins.example.com/job/ci/42".to_string()),
+            },
+        ];
+        let prompt = super::build_fix_run_prompt(
+            7,
+            "kulichevskiy/SymphonyMac",
+            "Add CI gating",
+            91,
+            "claude/issue-7",
+            "",
+            &failures,
+        );
+
+        // Codex section suppressed when feedback is empty.
+        assert!(!prompt.contains("Codex left this feedback"));
+        // CI section rendered with both checks.
+        assert!(prompt.contains("CI is failing"));
+        assert!(prompt.contains("Name: build"));
+        assert!(prompt.contains("State: FAILURE"));
+        assert!(prompt.contains("error[E0382]: borrow of moved value"));
+        assert!(prompt.contains("Name: ci/jenkins"));
+        assert!(prompt.contains("State: ERROR"));
+        // Missing log excerpt falls back to a clear "unavailable" line so the
+        // agent doesn't think the check passed.
+        assert!(prompt.contains("Log excerpt: (unavailable"));
+        assert!(prompt.contains("https://jenkins.example.com/job/ci/42"));
+        // Intent line reflects CI-only mode.
+        assert!(prompt.contains("fixing CI failures"));
+    }
+
+    #[test]
+    fn build_fix_run_prompt_renders_both_sections_when_codex_and_ci_both_present() {
+        let failures = vec![super::CiFailureContext {
+            name: "test".to_string(),
+            state: "FAILURE".to_string(),
+            log_excerpt: Some("FAILED tests/foo.rs::bar".to_string()),
+            details_url: None,
+        }];
+        let prompt = super::build_fix_run_prompt(
+            7,
+            "kulichevskiy/SymphonyMac",
+            "Add CI gating",
+            91,
+            "claude/issue-7",
+            "Please add a test for the regex edge case",
+            &failures,
+        );
+
+        assert!(prompt.contains("Codex left this feedback"));
+        assert!(prompt.contains("Please add a test for the regex edge case"));
+        assert!(prompt.contains("CI is failing"));
+        assert!(prompt.contains("FAILED tests/foo.rs::bar"));
+        // The combined intent line tells the agent both sources need handling.
+        assert!(prompt.contains("addressing Codex review feedback and CI failures"));
     }
 
     #[test]

@@ -41,6 +41,19 @@ pub mod pipeline_helpers {
         .await;
     }
 
+    /// Record the PR HEAD SHA we just spawned a CI-failure fix-run against.
+    /// Used by the review-poll loop to dedupe across ticks.
+    pub async fn set_last_ci_failure_sha(
+        state: &SharedState,
+        run_id: &str,
+        sha: Option<String>,
+    ) {
+        let _ = runtime::mutate_run(state, run_id, true, move |run| {
+            run.last_ci_failure_sha = sha;
+        })
+        .await;
+    }
+
     /// Synchronously transition the Review run from `Running` (polling
     /// sentinel) to `Preparing` (fix-run is being dispatched). Must be awaited
     /// *before* `tokio::spawn` is called for the fix-run, so the next poll tick
@@ -69,6 +82,8 @@ pub mod pipeline_helpers {
         .await;
     }
 }
+
+pub(crate) use self::prompt::CiFailureContext;
 
 use self::pipeline::{
     PipelineCompletionSpec, StageLaunchSpec, prepare_and_register_stage_run, spawn_next_stage,
