@@ -18,12 +18,15 @@ struct ReviewRunSnapshot {
     last_pushed_sha: Option<String>,
     review_iteration: u32,
     stage_context: Option<crate::orchestrator::StageContext>,
-    has_active_subprocess: bool,
 }
 
 pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
     let (snapshots, approve_patterns, feedback_marker) = {
         let s = state.lock().await;
+        // Only Running Review runs are polling sentinels — fix-runs being
+        // dispatched or executing are flipped to Preparing under-lock by
+        // `mark_review_run_dispatching_fix_run`, so this filter alone prevents
+        // the poll loop from re-entering for an in-flight fix-run.
         let snapshots: Vec<ReviewRunSnapshot> = s
             .runs
             .values()
@@ -42,7 +45,6 @@ pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
                 last_pushed_sha: run.last_pushed_sha.clone(),
                 review_iteration: run.review_iteration,
                 stage_context: run.stage_context.clone(),
-                has_active_subprocess: s.agent_pids.contains_key(&run.id),
             })
             .collect();
         (
@@ -53,13 +55,6 @@ pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
     };
 
     for snapshot in snapshots {
-        if snapshot.has_active_subprocess {
-            // A fix-run subprocess is currently rebasing, fixing, or pushing for
-            // this Review run. Don't poll for approval — we'd race the fix-run
-            // and could either advance to Merge prematurely or spawn a second
-            // fix-run on top of the first.
-            continue;
-        }
         check_codex_activity(app, state, snapshot, &approve_patterns, &feedback_marker).await;
     }
 }
@@ -203,8 +198,14 @@ async fn check_codex_activity(
     let branch_name = pr_state.head_ref_name.clone();
     let next_iteration = snapshot.review_iteration.saturating_add(1);
 
-    // Increment review_iteration BEFORE spawning so the UI immediately reflects
-    // the new iteration count and a re-entrant poll wouldn't double-increment.
+    // Increment review_iteration AND drop the run out of `Running` BEFORE we
+    // tokio::spawn the fix-run agent. The poll loop filters by `status ==
+    // Running`, so transitioning to `Preparing` synchronously here closes the
+    // race Codex flagged: even if the next poll tick fires before the spawned
+    // task registers a PID (e.g. while the `before_run` hook is still running),
+    // it will see the run is no longer in `Running` and skip it. The fix-run
+    // path inside `run_agent_process` keeps the run in `Preparing` until
+    // `finalize_fix_run_success` flips it back.
     let log_message = format!(
         "[review] Codex feedback detected ({} comment{}). Spawning fix-run iteration {}.",
         feedback_comments.len(),
@@ -216,6 +217,12 @@ async fn check_codex_activity(
         state,
         &snapshot.run_id,
         next_iteration,
+    )
+    .await;
+    crate::agent::pipeline_helpers::mark_review_run_dispatching_fix_run(
+        app,
+        state,
+        &snapshot.run_id,
     )
     .await;
 

@@ -40,6 +40,34 @@ pub mod pipeline_helpers {
         })
         .await;
     }
+
+    /// Synchronously transition the Review run from `Running` (polling
+    /// sentinel) to `Preparing` (fix-run is being dispatched). Must be awaited
+    /// *before* `tokio::spawn` is called for the fix-run, so the next poll tick
+    /// observes the run in `Preparing` and skips it instead of double-spawning.
+    pub async fn mark_review_run_dispatching_fix_run(
+        app: &AppHandle,
+        state: &SharedState,
+        run_id: &str,
+    ) {
+        use crate::orchestrator::{AgentStatus, PipelineStage};
+        let _ = runtime::transition_run(
+            app,
+            state,
+            run_id,
+            runtime::StatusTransition {
+                status: AgentStatus::Preparing,
+                stage_label: PipelineStage::Review.to_string(),
+                error: None,
+                finished: false,
+                log_message: None,
+                pending_next_stage: runtime::PendingNextStageUpdate::Keep,
+                emit_extra: serde_json::Map::new(),
+                persist_meta: true,
+            },
+        )
+        .await;
+    }
 }
 
 use self::pipeline::{
