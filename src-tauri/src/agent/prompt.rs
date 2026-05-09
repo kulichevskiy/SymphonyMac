@@ -110,6 +110,62 @@ exit with a non-zero exit code so the pipeline knows the merge did not succeed."
 /// prompt builder can swap in the TDD-reinforcement variant.
 pub(crate) const RED_GATE_RETRY_MARKER: &str = "[red-gate-failure]";
 
+/// Build the prompt for a Review-stage fix-run: the agent operates in the
+/// existing PR worktree, pulls the latest commits, addresses the verbatim
+/// Codex feedback, commits, and force-pushes with `--force-with-lease`.
+///
+/// `feedback` is the raw, joined Codex review comments newer than the run's
+/// `last_review_request_at`. We pass them through verbatim so the agent reads
+/// the same words Codex wrote.
+pub(crate) fn build_fix_run_prompt(
+    issue_number: u64,
+    repo: &str,
+    issue_title: &str,
+    pr_number: u64,
+    branch_name: &str,
+    feedback: &str,
+) -> String {
+    format!(
+        "\
+You are addressing Codex review feedback on Pull Request #{pr_number} in repository {repo}.
+
+Issue: #{issue_number} — {issue_title}
+Branch: {branch_name}
+
+You are running INSIDE the existing PR worktree. Do NOT clone, do NOT switch branches, \
+do NOT touch unrelated history.
+
+Codex left this feedback (verbatim, all comments since the last review request):
+
+---
+{feedback}
+---
+
+What to do:
+
+1. Sync the branch with the latest remote state:
+   git pull --rebase
+2. Read the feedback carefully and decide for each point whether it is a valid concern \
+or a misunderstanding.
+   - For valid concerns: fix them in the smallest scope possible. No drive-by refactors, \
+no unrelated cleanup.
+   - For points you genuinely disagree with: leave the code alone (the orchestrator will \
+re-request a Codex review after you push, so Codex can revisit).
+3. Commit your fixes with a descriptive message. Do NOT amend or squash existing commits — \
+add new ones on top.
+4. Force-push the updated branch:
+   git push --force-with-lease
+
+Hard rules:
+- Do NOT create a new PR. Push to the existing branch.
+- Do NOT close or reopen the PR.
+- Do NOT comment on the PR yourself — the orchestrator handles re-requesting a review.
+- Do NOT run `gh pr merge` — merging is a later pipeline stage.
+- If the feedback is empty, ambiguous, or you cannot make progress, exit non-zero so the \
+pipeline marks this fix-run as failed instead of pretending to succeed."
+    )
+}
+
 /// Aggressive reinforcement prompt used when the red-gate failed on the prior
 /// Implement attempt. Re-states the contract in stronger terms and forces the
 /// agent to start the branch over.

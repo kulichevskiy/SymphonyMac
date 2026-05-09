@@ -61,6 +61,7 @@ export function buildDashboardColumns(
       blockedBy: blockedMap.get(issueKey),
       skippedStages,
       pendingNextStage: run?.pending_next_stage ?? null,
+      reviewIteration: run?.review_iteration,
     };
   }
 

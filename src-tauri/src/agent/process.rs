@@ -349,6 +349,13 @@ pub(crate) async fn run_agent_process(
             },
         )
         .await;
+    } else if request.spec.is_fix_run {
+        // Fix-runs hold the Review run in Running while the subprocess executes
+        // and stay Running after success — `finalize_fix_run_success` re-posts
+        // `@codex review` and transitions back to Running with a fresh SHA.
+        // We just need to flush the pending status emit so the UI sees the
+        // subprocess finished cleanly.
+        let _ = emit_extra;
     } else {
         let _ = runtime::transition_run(
             &app,
@@ -382,7 +389,48 @@ pub(crate) async fn run_agent_process(
     run_after_run_hook(&state, &request.run_id, &request.spec.workspace_path).await;
 
     if !succeeded {
+        if request.spec.is_fix_run {
+            // Fix-run failures terminate the Review run — there is no retry path
+            // (we set max_retries=0 on fix-run specs), and falling into
+            // `handle_failed_attempt` would only emit a duplicate failure
+            // notification. The Failed status was already set above.
+            runtime::update_dock_badge(&state).await;
+            return;
+        }
         handle_failed_attempt(&app, &state, &request, &stage_label).await;
+        return;
+    }
+
+    if request.spec.is_fix_run {
+        if let Err(error) = pipeline::finalize_fix_run_success(
+            &app,
+            &state,
+            &request.run_id,
+            &request.spec.repo,
+            request.spec.issue_number,
+        )
+        .await
+        {
+            let mut emit_extra = Map::new();
+            emit_extra.insert("error".to_string(), json!(error.clone()));
+            let _ = runtime::transition_run(
+                &app,
+                &state,
+                &request.run_id,
+                StatusTransition {
+                    status: AgentStatus::Failed,
+                    stage_label: stage_label.clone(),
+                    error: Some(error.clone()),
+                    finished: true,
+                    log_message: Some(format!("[review] {}", error)),
+                    pending_next_stage: PendingNextStageUpdate::Keep,
+                    emit_extra,
+                    persist_meta: true,
+                },
+            )
+            .await;
+        }
+        runtime::update_dock_badge(&state).await;
         return;
     }
 
@@ -939,6 +987,7 @@ fn next_stage_spec(
         max_retries: current.max_retries,
         previous_error,
         previous_context,
+        is_fix_run: false,
     }
 }
 

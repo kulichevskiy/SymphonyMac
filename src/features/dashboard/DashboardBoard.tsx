@@ -152,6 +152,8 @@ function DashboardCard({
           <span className="text-xs" style={{ color }}>
             {STAGE_LABELS[card.runStage || ""] || card.runStage}
             {card.attempt && card.attempt > 1 && ` (attempt ${card.attempt}/${(card.maxRetries || 0) + 1})`}
+            {card.runStage === "review" && card.reviewIteration && card.reviewIteration > 0 &&
+              ` (iteration ${card.reviewIteration})`}
             {" - "}
             {card.elapsed}
           </span>

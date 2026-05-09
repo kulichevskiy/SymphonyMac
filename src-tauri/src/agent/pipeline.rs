@@ -22,6 +22,10 @@ pub(crate) struct StageLaunchSpec {
     pub max_retries: u32,
     pub previous_error: String,
     pub previous_context: Option<StageContext>,
+    /// True when this spec drives a Review-stage fix-run launched in response to
+    /// Codex feedback. Fix-runs reuse the Review polling run's id, skip the
+    /// red-gate, and on success re-post `@codex review` instead of advancing.
+    pub is_fix_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +324,7 @@ async fn register_review_run(
         pending_next_stage: None,
         last_pushed_sha: None,
         last_review_request_at: None,
+        review_iteration: 0,
     };
     super::runtime::register_preparing_run(app, state, run, Map::new()).await;
     run_id
@@ -345,6 +350,155 @@ async fn resolve_pr_for_review(
             None
         }
     }
+}
+
+/// Snapshot of the Review run + its open PR captured under-lock for the
+/// fix-run dispatcher. Carries everything the spawn function needs without
+/// re-acquiring the state lock or re-querying GitHub.
+#[derive(Debug, Clone)]
+pub(crate) struct FixRunSnapshot {
+    pub run_id: String,
+    pub repo: String,
+    pub issue_number: u64,
+    pub issue_title: String,
+    pub issue_labels: Vec<String>,
+    pub workspace_path: PathBuf,
+    pub previous_context: Option<StageContext>,
+    pub pr_number: u64,
+    pub branch_name: String,
+    pub feedback: String,
+}
+
+/// Spawn a Review-stage fix-run agent. The fix-run reuses the polling Review
+/// run's id (so its logs accrue on the same record) and runs the agent in the
+/// existing worktree. On success the fix-run completion path inside
+/// `run_agent_process` re-posts `@codex review` and refreshes
+/// `last_pushed_sha` / `last_review_request_at`.
+///
+/// `review_iteration` must already have been incremented by the caller —
+/// `orchestrator::review` does that under-lock during its pre-spawn guards.
+pub(crate) fn spawn_fix_run(app: AppHandle, state: SharedState, snapshot: FixRunSnapshot) {
+    tokio::spawn(async move {
+        let config = {
+            let s = state.lock().await;
+            s.config.clone()
+        };
+
+        let prompt = super::prompt::build_fix_run_prompt(
+            snapshot.issue_number,
+            &snapshot.repo,
+            &snapshot.issue_title,
+            snapshot.pr_number,
+            &snapshot.branch_name,
+            &snapshot.feedback,
+        );
+        let (command, args) = build_command_args(&config, &prompt);
+        let command_display = format_command_display(&command, &args);
+
+        // Reflect the fix-run command + activity on the Review run so the UI
+        // shows what's happening while the subprocess executes.
+        let new_command_display = command_display.clone();
+        let _ = super::runtime::mutate_run(&state, &snapshot.run_id, true, move |run| {
+            run.command_display = Some(new_command_display);
+            run.activity = Some("Applying Codex feedback".to_string());
+        })
+        .await;
+
+        let spec = StageLaunchSpec {
+            repo: snapshot.repo.clone(),
+            issue_number: snapshot.issue_number,
+            issue_title: snapshot.issue_title.clone(),
+            issue_body: String::new(),
+            stage: PipelineStage::Review,
+            issue_labels: snapshot.issue_labels.clone(),
+            workspace_path: snapshot.workspace_path.clone(),
+            attempt: 1,
+            max_retries: 0,
+            previous_error: String::new(),
+            previous_context: snapshot.previous_context.clone(),
+            is_fix_run: true,
+        };
+
+        let request = AgentProcessRequest {
+            run_id: snapshot.run_id.clone(),
+            command,
+            args,
+            spec,
+        };
+
+        run_agent_process(app, state, request).await;
+    });
+}
+
+/// Called after a fix-run subprocess exits successfully. Re-posts
+/// `@codex review` on the PR, refreshes `last_pushed_sha` from the new HEAD,
+/// updates `last_review_request_at`, and transitions the Review run back to
+/// Running so the orchestrator's poll loop resumes watching for approval.
+///
+/// Returns Ok on success or an error string on failure (caller marks the run
+/// Failed).
+pub(crate) async fn finalize_fix_run_success(
+    app: &AppHandle,
+    state: &SharedState,
+    run_id: &str,
+    repo: &str,
+    issue_number: u64,
+) -> Result<(), String> {
+    let pr = match crate::github::pr_full_state(repo, issue_number).await {
+        Ok(Some(pr)) => pr,
+        Ok(None) => {
+            return Err(format!(
+                "fix-run finished but no open PR found for issue #{}",
+                issue_number
+            ));
+        }
+        Err(error) => return Err(format!("fix-run finished but PR lookup failed: {}", error)),
+    };
+
+    crate::github::post_codex_review(repo, pr.number)
+        .await
+        .map_err(|error| format!("fix-run finished but @codex review re-post failed: {}", error))?;
+
+    let request_timestamp = Utc::now().to_rfc3339();
+    let new_sha = pr.head_ref_oid.clone();
+    let request_ts_for_run = request_timestamp.clone();
+    let _ = super::runtime::mutate_run(state, run_id, true, move |run| {
+        run.last_pushed_sha = new_sha;
+        run.last_review_request_at = Some(request_ts_for_run);
+        run.activity = Some("Awaiting Codex".to_string());
+        run.command_display = Some(
+            "gh pr comment <PR> --body \"@codex review\"".to_string(),
+        );
+    })
+    .await;
+
+    let posted_log = format!(
+        "[review] Fix-run pushed; re-posted @codex review (PR #{}{}). Polling for approval.",
+        pr.number,
+        pr.head_ref_oid
+            .as_ref()
+            .map(|sha| format!(", PR HEAD {}", sha))
+            .unwrap_or_default(),
+    );
+
+    super::runtime::transition_run(
+        app,
+        state,
+        run_id,
+        super::runtime::StatusTransition {
+            status: AgentStatus::Running,
+            stage_label: PipelineStage::Review.to_string(),
+            error: None,
+            finished: false,
+            log_message: Some(posted_log),
+            pending_next_stage: super::runtime::PendingNextStageUpdate::Keep,
+            emit_extra: Map::new(),
+            persist_meta: true,
+        },
+    )
+    .await;
+
+    Ok(())
 }
 
 async fn fail_review_run(state: &SharedState, run_id: &str, error: String) {
@@ -516,6 +670,7 @@ fn prepare_stage_run(config: &RunConfig, spec: StageLaunchSpec) -> PreparedStage
         pending_next_stage: None,
         last_pushed_sha: None,
         last_review_request_at: None,
+        review_iteration: 0,
     };
 
     let request = AgentProcessRequest {
@@ -724,6 +879,7 @@ fn build_done_run(
         pending_next_stage: None,
         last_pushed_sha: None,
         last_review_request_at: None,
+        review_iteration: 0,
     };
 
     (done_run, pipeline_report)
@@ -886,6 +1042,7 @@ mod tests {
             pending_next_stage: None,
             last_pushed_sha: None,
             last_review_request_at: None,
+            review_iteration: 0,
         }
     }
 
@@ -1162,6 +1319,7 @@ mod tests {
             pending_next_stage: None,
             last_pushed_sha: None,
             last_review_request_at: None,
+            review_iteration: 0,
         };
 
         let context = extract_stage_context(&run, "pedrocid/SymphonyMac");

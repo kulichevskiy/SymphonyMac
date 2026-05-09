@@ -16,6 +16,32 @@ pub mod runtime_helpers {
     }
 }
 
+pub mod pipeline_helpers {
+    //! Thin wrappers over `pipeline` and `runtime` so the orchestrator's review
+    //! poll loop can spawn fix-runs and bump `review_iteration` without
+    //! depending on the private pipeline API.
+
+    use super::pipeline;
+    use super::runtime;
+    use crate::SharedState;
+    use tauri::AppHandle;
+
+    pub(crate) use super::pipeline::FixRunSnapshot;
+
+    /// Spawn a Review-stage fix-run agent for the given snapshot.
+    pub fn spawn_fix_run(app: &AppHandle, state: &SharedState, snapshot: FixRunSnapshot) {
+        pipeline::spawn_fix_run(app.clone(), state.clone(), snapshot);
+    }
+
+    /// Update `review_iteration` on the Review run. Persisted.
+    pub async fn set_review_iteration(state: &SharedState, run_id: &str, iteration: u32) {
+        let _ = runtime::mutate_run(state, run_id, true, move |run| {
+            run.review_iteration = iteration;
+        })
+        .await;
+    }
+}
+
 use self::pipeline::{
     PipelineCompletionSpec, StageLaunchSpec, prepare_and_register_stage_run, spawn_next_stage,
 };
@@ -141,6 +167,7 @@ pub async fn advance_review_to_merge(
             max_retries,
             previous_error: String::new(),
             previous_context,
+            is_fix_run: false,
         },
     );
 }
@@ -190,6 +217,7 @@ pub async fn launch_agent(
         max_retries: config.max_retries,
         previous_error: String::new(),
         previous_context: None,
+        is_fix_run: false,
     };
 
     if matches!(stage, PipelineStage::Review) {
@@ -447,6 +475,7 @@ pub async fn approve_stage(
         },
         previous_error: String::new(),
         previous_context,
+        is_fix_run: false,
     };
 
     if matches!(next_stage, PipelineStage::Review) {
@@ -692,6 +721,7 @@ pub async fn advance_to_stage(
         max_retries,
         previous_error: String::new(),
         previous_context,
+        is_fix_run: false,
     };
 
     if matches!(effective_stage, PipelineStage::Review) {

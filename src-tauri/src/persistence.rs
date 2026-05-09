@@ -239,6 +239,7 @@ mod tests {
             pending_next_stage: None,
             last_pushed_sha: None,
             last_review_request_at: None,
+            review_iteration: 0,
         }
     }
 
