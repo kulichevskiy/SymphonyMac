@@ -241,6 +241,7 @@ mod tests {
             last_review_request_at: None,
             review_iteration: 0,
             last_ci_failure_sha: None,
+            ci_status_fetch_failure_count: 0,
         }
     }
 

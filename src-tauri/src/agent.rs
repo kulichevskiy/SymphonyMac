@@ -54,6 +54,49 @@ pub mod pipeline_helpers {
         .await;
     }
 
+    /// Update the consecutive `pr_ci_status` fetch failure counter on the
+    /// Review run. Persisted so the threshold check survives across orchestrator
+    /// poll ticks (and process restarts).
+    pub async fn set_ci_status_fetch_failure_count(
+        state: &SharedState,
+        run_id: &str,
+        count: u32,
+    ) {
+        let _ = runtime::mutate_run(state, run_id, true, move |run| {
+            run.ci_status_fetch_failure_count = count;
+        })
+        .await;
+    }
+
+    /// Fail a Review run terminally with the given error message — used when
+    /// the CI-status fetch deadlock breaks our advance path.
+    pub async fn fail_review_run_with_error(
+        app: &AppHandle,
+        state: &SharedState,
+        run_id: &str,
+        error: String,
+    ) {
+        use crate::orchestrator::{AgentStatus, PipelineStage};
+        let mut emit_extra = serde_json::Map::new();
+        emit_extra.insert("error".to_string(), serde_json::json!(error.clone()));
+        let _ = runtime::transition_run(
+            app,
+            state,
+            run_id,
+            runtime::StatusTransition {
+                status: AgentStatus::Failed,
+                stage_label: PipelineStage::Review.to_string(),
+                error: Some(error),
+                finished: true,
+                log_message: None,
+                pending_next_stage: runtime::PendingNextStageUpdate::Keep,
+                emit_extra,
+                persist_meta: true,
+            },
+        )
+        .await;
+    }
+
     /// Synchronously transition the Review run from `Running` (polling
     /// sentinel) to `Preparing` (fix-run is being dispatched). Must be awaited
     /// *before* `tokio::spawn` is called for the fix-run, so the next poll tick

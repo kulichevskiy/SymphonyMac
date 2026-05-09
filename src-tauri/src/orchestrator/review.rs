@@ -17,6 +17,18 @@ const MAX_CI_FAILURES_IN_PROMPT: usize = 5;
 /// that order of magnitude and protects against pathological one-line logs.
 const CI_LOG_EXCERPT_MAX_CHARS: usize = 4000;
 
+/// Number of consecutive `pr_ci_status` fetch failures we tolerate on a run
+/// that has Codex approval before failing the run terminally. Without this
+/// cutoff, a permanently broken `gh` (e.g. missing checks-read scope) would
+/// strand approved PRs in Review forever, since the approval-path falls
+/// through to `WaitForCiUnknown` on every fetch failure.
+///
+/// Sized so users get ~5 minutes of transient retry headroom at the default
+/// 60s poll interval — enough to absorb a brief network blip, short enough
+/// that a permanent permissions issue surfaces visibly instead of silently
+/// deadlocking the pipeline.
+const CI_STATUS_FETCH_FAILURE_THRESHOLD: u32 = 5;
+
 #[derive(Debug, Clone)]
 struct ReviewRunSnapshot {
     run_id: String,
@@ -31,6 +43,10 @@ struct ReviewRunSnapshot {
     review_iteration: u32,
     stage_context: Option<crate::orchestrator::StageContext>,
     last_ci_failure_sha: Option<String>,
+    /// Snapshot of the run's consecutive `pr_ci_status` failure counter at the
+    /// start of this poll tick. Used to decide whether a fresh fetch failure
+    /// pushes us over the terminal-failure threshold.
+    ci_status_fetch_failure_count: u32,
 }
 
 pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
@@ -60,6 +76,7 @@ pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
                     review_iteration: run.review_iteration,
                     stage_context: run.stage_context.clone(),
                     last_ci_failure_sha: run.last_ci_failure_sha.clone(),
+                    ci_status_fetch_failure_count: run.ci_status_fetch_failure_count,
                 })
                 .collect();
         (
@@ -130,27 +147,62 @@ async fn check_codex_activity(
         return;
     }
 
-    // CI status fetch is best-effort: a transient `gh` failure must not bring
-    // down the rest of the polling loop. When unavailable, we treat CI as
-    // "unknown" — the approval gate refuses to advance (we'd rather wait one
-    // more tick than ship without a CI verdict), and the fix-run path simply
-    // skips the CI-failure trigger this tick.
+    // CI status fetch is best-effort per tick: a transient `gh` failure must
+    // not bring down the rest of the polling loop. When unavailable, we treat
+    // CI as "unknown" and refuse to advance the approval path — we'd rather
+    // wait one more tick than ship without a CI verdict.
+    //
+    // BUT: we also track consecutive failures on the run, so a *permanent*
+    // breakage (e.g. missing `checks:read` scope on `gh`) doesn't silently
+    // deadlock approved PRs in Review forever. Once `WaitForCiUnknown` would
+    // fire AND the counter is over the threshold, we surface a terminal error
+    // on the run instead of looping silently. The counter resets to 0 on every
+    // successful fetch.
     let ci_status: Option<PrCiStatus> =
         match github::pr_ci_status(&snapshot.repo, pr_state.number).await {
-            Ok(status) => Some(status),
+            Ok(status) => {
+                if snapshot.ci_status_fetch_failure_count > 0 {
+                    // Reset the counter so a future broken streak starts fresh.
+                    let _ = crate::agent::pipeline_helpers::set_ci_status_fetch_failure_count(
+                        state,
+                        &snapshot.run_id,
+                        0,
+                    )
+                    .await;
+                }
+                Some(status)
+            }
             Err(error) => {
+                let new_count = snapshot.ci_status_fetch_failure_count.saturating_add(1);
+                let _ = crate::agent::pipeline_helpers::set_ci_status_fetch_failure_count(
+                    state,
+                    &snapshot.run_id,
+                    new_count,
+                )
+                .await;
                 crate::agent::runtime_helpers::append_log(
                     state,
                     &snapshot.run_id,
                     format!(
-                        "[review] Failed to fetch CI status for PR #{}: {} — will retry next tick.",
-                        pr_state.number, error
+                        "[review] Failed to fetch CI status for PR #{}: {} — will retry next tick (failure {} of {}).",
+                        pr_state.number,
+                        error,
+                        new_count,
+                        CI_STATUS_FETCH_FAILURE_THRESHOLD
                     ),
                 )
                 .await;
                 None
             }
         };
+
+    // Effective counter: snapshot value + 1 if this tick's fetch failed.
+    // We need the *post-update* value for the threshold check below.
+    let effective_fetch_failure_count = if ci_status.is_some() {
+        0
+    } else {
+        snapshot.ci_status_fetch_failure_count.saturating_add(1)
+    };
 
     let head_match =
         head_sha_matches(snapshot.last_pushed_sha.as_deref(), pr_state.head_ref_oid.as_deref());
@@ -223,12 +275,38 @@ async fn check_codex_activity(
                 return;
             }
             ApprovalOutcome::WaitForCiUnknown => {
+                if ci_fetch_failure_should_terminate(effective_fetch_failure_count) {
+                    let error = format!(
+                        "Codex approved PR #{} but CI status fetch failed {} consecutive times. \
+This usually means `gh pr view --json statusCheckRollup` cannot read the rollup \
+(missing `checks:read` permission, repo restrictions, or a persistent gh outage). \
+Failing the run terminally so the deadlock is visible — fix the underlying \
+permissions/auth and resume manually.",
+                        pr_state.number, effective_fetch_failure_count,
+                    );
+                    crate::agent::runtime_helpers::append_log(
+                        state,
+                        &snapshot.run_id,
+                        format!("[review] {}", error),
+                    )
+                    .await;
+                    crate::agent::pipeline_helpers::fail_review_run_with_error(
+                        app,
+                        state,
+                        &snapshot.run_id,
+                        error,
+                    )
+                    .await;
+                    return;
+                }
                 crate::agent::runtime_helpers::append_log(
                     state,
                     &snapshot.run_id,
                     format!(
-                        "[review] Codex approval detected at {}, but CI status is unknown this tick. Holding in Review until CI status can be fetched.",
-                        comment.created_at
+                        "[review] Codex approval detected at {}, but CI status is unknown this tick (failure {} of {}). Holding in Review until CI status can be fetched.",
+                        comment.created_at,
+                        effective_fetch_failure_count,
+                        CI_STATUS_FETCH_FAILURE_THRESHOLD,
                     ),
                 )
                 .await;
@@ -536,6 +614,13 @@ enum ApprovalOutcome {
     CiFailing,
 }
 
+/// True when the consecutive CI-status-fetch failure count has reached the
+/// terminal threshold. Extracted as a free function so the boundary is
+/// directly unit-testable and the constant lives in one place.
+fn ci_fetch_failure_should_terminate(failure_count: u32) -> bool {
+    failure_count >= CI_STATUS_FETCH_FAILURE_THRESHOLD
+}
+
 fn decide_approval_outcome(ci_status: Option<&PrCiStatus>) -> ApprovalOutcome {
     let Some(status) = ci_status else {
         return ApprovalOutcome::WaitForCiUnknown;
@@ -823,6 +908,28 @@ mod tests {
     }
 
     #[test]
+    fn ci_fetch_failure_should_terminate_only_at_or_above_threshold() {
+        // Below threshold: keep retrying. The orchestrator stays in
+        // WaitForCiUnknown and logs "failure N of THRESHOLD".
+        for count in 0..CI_STATUS_FETCH_FAILURE_THRESHOLD {
+            assert!(
+                !ci_fetch_failure_should_terminate(count),
+                "count {count} should NOT terminate (threshold is {CI_STATUS_FETCH_FAILURE_THRESHOLD})",
+            );
+        }
+        // At threshold: terminate. This is the boundary Codex's P1 was about —
+        // we must not keep silently retrying when `gh` is permanently broken.
+        assert!(ci_fetch_failure_should_terminate(
+            CI_STATUS_FETCH_FAILURE_THRESHOLD
+        ));
+        // Far above threshold: still terminate (defensive against counter math
+        // overshoot).
+        assert!(ci_fetch_failure_should_terminate(
+            CI_STATUS_FETCH_FAILURE_THRESHOLD + 100
+        ));
+    }
+
+    #[test]
     fn should_trigger_ci_fix_run_only_when_failures_present_and_sha_is_new() {
         let failing_with_run =
             pr_check("build", github::CheckState::Failure, true, Some("9999"));
@@ -912,6 +1019,7 @@ mod tests {
             last_review_request_at: None,
             review_iteration: 0,
             last_ci_failure_sha: None,
+            ci_status_fetch_failure_count: 0,
         }
     }
 
