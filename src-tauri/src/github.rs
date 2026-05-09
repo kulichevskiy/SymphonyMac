@@ -541,8 +541,13 @@ pub async fn is_pr_merged_for_issue(repo: &str, issue_number: u64) -> Result<boo
         .await
 }
 
-/// Find an open PR associated with `issue_number` in `repo`. Returns its full state
+/// Find the open PR associated with `issue_number` in `repo`. Returns its full state
 /// (number, state, branch, HEAD oid, and comments) — used by the Review stage poll loop.
+///
+/// Restricted to `--state open` on purpose: an issue may have historical merged or
+/// closed PRs, but the Review stage targets the *active* PR. Picking up an old
+/// merged PR here would let `@codex review` go to the wrong thread and accept stale
+/// approvals.
 pub async fn pr_full_state(
     repo: &str,
     issue_number: u64,
@@ -554,7 +559,7 @@ pub async fn pr_full_state(
         "-R",
         repo,
         "--state",
-        "all",
+        "open",
         "--limit",
         "50",
         "--json",
@@ -565,12 +570,24 @@ pub async fn pr_full_state(
     let prs: Vec<serde_json::Value> =
         serde_json::from_str(&output).map_err(|e| format!("Failed to parse PRs: {}", e))?;
 
+    Ok(select_pr_full_state(&prs, issue_number))
+}
+
+fn select_pr_full_state(
+    prs: &[serde_json::Value],
+    issue_number: u64,
+) -> Option<PullRequestFullState> {
     for pr in prs {
         let body = pr["body"].as_str().unwrap_or("");
         let title = pr["title"].as_str().unwrap_or("");
+        let state = pr["state"].as_str().unwrap_or("");
         let references_issue = parse_closes_issue(body) == Some(issue_number)
             || parse_issue_from_title(title) == Some(issue_number);
-        if !references_issue {
+
+        // Defense in depth against API responses that include non-open PRs:
+        // even though we ask for `--state open`, ignore anything that came back
+        // tagged otherwise so a stale merged PR can never win this lookup.
+        if !references_issue || (!state.is_empty() && state != "OPEN") {
             continue;
         }
 
@@ -588,16 +605,16 @@ pub async fn pr_full_state(
             })
             .unwrap_or_default();
 
-        return Ok(Some(PullRequestFullState {
+        return Some(PullRequestFullState {
             number: pr["number"].as_u64().unwrap_or(0),
-            state: pr["state"].as_str().unwrap_or("").to_string(),
+            state: state.to_string(),
             head_ref_name: pr["headRefName"].as_str().unwrap_or("").to_string(),
             head_ref_oid: pr["headRefOid"].as_str().map(|s| s.to_string()),
             comments,
-        }));
+        });
     }
 
-    Ok(None)
+    None
 }
 
 /// Post `@codex review` as an issue-level comment on the given PR.
@@ -812,6 +829,56 @@ mod tests {
         // empty inputs
         assert!(!parse_codex_approval("", &patterns, marker));
         assert!(!parse_codex_approval("anything", &[], marker));
+    }
+
+    #[test]
+    fn test_select_pr_full_state_skips_merged_pr_and_picks_open_one() {
+        // Simulates the case where an issue has both a historical merged PR and a
+        // current open PR. The selector must return the open one even if the
+        // merged PR appears first in the list.
+        let prs = serde_json::json!([
+            {
+                "number": 100,
+                "title": "Fix #42: old attempt",
+                "body": "Closes #42",
+                "state": "MERGED",
+                "headRefName": "old-branch",
+                "headRefOid": "old111",
+                "comments": []
+            },
+            {
+                "number": 200,
+                "title": "Fix #42: current attempt",
+                "body": "Closes #42",
+                "state": "OPEN",
+                "headRefName": "new-branch",
+                "headRefOid": "new222",
+                "comments": []
+            }
+        ]);
+        let prs_array = prs.as_array().unwrap();
+
+        let selected = select_pr_full_state(prs_array, 42).expect("an open PR should be selected");
+        assert_eq!(selected.number, 200);
+        assert_eq!(selected.state, "OPEN");
+        assert_eq!(selected.head_ref_oid.as_deref(), Some("new222"));
+    }
+
+    #[test]
+    fn test_select_pr_full_state_returns_none_when_no_open_pr_references_issue() {
+        let prs = serde_json::json!([
+            {
+                "number": 100,
+                "title": "Fix #42: old attempt",
+                "body": "Closes #42",
+                "state": "MERGED",
+                "headRefName": "old-branch",
+                "headRefOid": "old111",
+                "comments": []
+            }
+        ]);
+        let prs_array = prs.as_array().unwrap();
+        assert!(select_pr_full_state(prs_array, 42).is_none());
     }
 
     #[test]
