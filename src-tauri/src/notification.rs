@@ -39,6 +39,18 @@ pub fn notify_awaiting_approval(app: &AppHandle, issue_number: u64, stage: &str,
     );
 }
 
+pub fn notify_review_escape(app: &AppHandle, issue_number: u64, reason: &str, sound: bool) {
+    send_notification(
+        app,
+        "Review Loop Escape",
+        &format!(
+            "Issue #{} parked awaiting approval — {}",
+            issue_number, reason
+        ),
+        sound,
+    );
+}
+
 pub fn notify_all_processed(app: &AppHandle, sound: bool) {
     send_notification(
         app,

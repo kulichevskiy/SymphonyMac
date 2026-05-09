@@ -43,4 +43,6 @@ export const DEFAULT_RUN_CONFIG: RunConfig = {
   codex_feedback_marker: "Useful? React with 👍 / 👎.",
   local_repos: {},
   custom_agent_command: "",
+  max_review_iterations: 10,
+  cost_cap_per_issue_usd: 5.0,
 };

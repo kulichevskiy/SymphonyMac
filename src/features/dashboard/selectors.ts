@@ -42,6 +42,13 @@ export function buildDashboardColumns(
       ? run.skipped_stages
       : issueRuns.find((candidate) => candidate.skipped_stages?.length)?.skipped_stages ?? [];
 
+    // The backend computes `issue_cost_usd` per-run already (sum across all
+    // runs for the same repo+issue). If the field isn't on the run object,
+    // fall back to summing here so older payloads still render something.
+    const issueCostUsd =
+      run?.issue_cost_usd ??
+      issueRuns.reduce((acc, candidate) => acc + (candidate.cost_usd ?? 0), 0);
+
     return {
       id: run?.id ?? `issue-${issueKey}`,
       issueKey,
@@ -62,6 +69,10 @@ export function buildDashboardColumns(
       skippedStages,
       pendingNextStage: run?.pending_next_stage ?? null,
       reviewIteration: run?.review_iteration,
+      maxReviewIterations: status.config.max_review_iterations,
+      issueCostUsd,
+      costCapPerIssueUsd: status.config.cost_cap_per_issue_usd,
+      lastTriggerSummary: run?.last_trigger_summary ?? null,
     };
   }
 

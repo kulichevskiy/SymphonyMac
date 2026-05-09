@@ -95,6 +95,30 @@ export function DashboardBoard({
   );
 }
 
+function ReviewMeta({ card }: { card: KanbanCard }) {
+  const iteration = card.reviewIteration ?? 0;
+  const cap = card.maxReviewIterations ?? 0;
+  const issueCost = card.issueCostUsd ?? 0;
+  const costCap = card.costCapPerIssueUsd ?? 0;
+  const trigger = card.lastTriggerSummary;
+
+  // Show iteration / cost any time we're on the review card so the operator
+  // can see how close the run is to the configured caps even at iteration 0.
+  return (
+    <div className="text-[11px] text-[#8b949e] mb-2 leading-snug">
+      <div>
+        Iteration: {iteration}
+        {cap > 0 ? `/${cap}` : ""}
+      </div>
+      <div>
+        Cost: ${issueCost.toFixed(2)}
+        {costCap > 0 ? ` / $${costCap.toFixed(2)}` : ""}
+      </div>
+      {trigger && <div>Last trigger: {trigger}</div>}
+    </div>
+  );
+}
+
 interface DashboardCardProps
   extends Omit<
     DashboardBoardProps,
@@ -152,13 +176,16 @@ function DashboardCard({
           <span className="text-xs" style={{ color }}>
             {STAGE_LABELS[card.runStage || ""] || card.runStage}
             {card.attempt && card.attempt > 1 && ` (attempt ${card.attempt}/${(card.maxRetries || 0) + 1})`}
-            {card.runStage === "review" && card.reviewIteration && card.reviewIteration > 0 &&
-              ` (iteration ${card.reviewIteration})`}
             {" - "}
             {card.elapsed}
           </span>
         </div>
       )}
+
+      {card.runStage === "review" &&
+        (card.runStatus === "running" ||
+          card.runStatus === "preparing" ||
+          card.runStatus === "awaiting_approval") && <ReviewMeta card={card} />}
 
       {card.runStatus === "preparing" && (
         <div className="flex items-center gap-1.5 mb-2">

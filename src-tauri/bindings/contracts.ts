@@ -78,7 +78,20 @@ last_ci_failure_sha: string | null,
  * broken `gh` (e.g. missing permissions) doesn't silently strand approved
  * PRs in Review forever.
  */
-ci_status_fetch_failure_count: number, };
+ci_status_fetch_failure_count: number, 
+/**
+ * Signature of the trigger set used to spawn the most recent fix-run on
+ * this Review run. Used by the stuck-loop escape: if two consecutive
+ * fix-runs are about to fire with identical signatures, the agent is
+ * going in circles and the run transitions to `AwaitingApproval` instead.
+ */
+last_trigger_signature: string | null, 
+/**
+ * Short, human-readable label describing the trigger that spawned the
+ * most recent fix-run on this Review run (e.g. "Codex feedback",
+ * "CI failure: build", "Conflict"). Surfaced in the dashboard Review card.
+ */
+last_trigger_summary: string | null, };
 
 export type AgentStatus = "preparing" | "running" | "completed" | "failed" | "stopped" | "interrupted" | "awaiting_approval";
 
@@ -165,9 +178,36 @@ local_repos: { [key in string]: string },
  * If no `{{prompt}}` placeholder is present, the prompt is appended as the last argument.
  * Example: `aider --yes-always {{prompt}}`
  */
-custom_agent_command: string, };
+custom_agent_command: string, 
+/**
+ * Hard cap on review-loop fix-run iterations per Review run. When the
+ * `review_iteration` counter reaches this value the next fix-run trigger
+ * transitions the run to `AwaitingApproval` instead of spawning another
+ * agent. Default 10. Set to 0 to disable the cap.
+ */
+max_review_iterations: number, 
+/**
+ * Cumulative cost cap (USD) summed across every run for the same
+ * (repo, issue). When exceeded, the next fix-run trigger transitions the
+ * Review run to `AwaitingApproval` instead of spawning another agent.
+ * Default $5.00. Set to 0.0 to disable the cap.
+ */
+cost_cap_per_issue_usd: number, };
 
-export type RunSummary = { id: string, repo: string, issue_number: bigint, issue_title: string, status: AgentStatus, stage: PipelineStage, started_at: string, finished_at: string | null, workspace_path: string, error: string | null, attempt: number, max_retries: number, command_display: string | null, agent_type: string, last_log_line: string | null, log_count: number, activity: string | null, last_log_timestamp: string | null, skipped_stages: Array<string>, pending_next_stage: string | null, review_iteration: number, };
+export type RunSummary = { id: string, repo: string, issue_number: bigint, issue_title: string, status: AgentStatus, stage: PipelineStage, started_at: string, finished_at: string | null, workspace_path: string, error: string | null, attempt: number, max_retries: number, command_display: string | null, agent_type: string, last_log_line: string | null, log_count: number, activity: string | null, last_log_timestamp: string | null, skipped_stages: Array<string>, pending_next_stage: string | null, review_iteration: number, 
+/**
+ * Cumulative cost (USD) summed across every run for the same
+ * (repo, issue) — surfaced on the dashboard Review card so operators can
+ * see how close the run is to the cost cap.
+ */
+issue_cost_usd: number, 
+/**
+ * Short summary of the trigger that fired the most recent fix-run on
+ * this run (e.g. "Codex feedback", "CI failure: build", "Conflict").
+ * Surfaced on the Review card so operators see the latest trigger
+ * without opening the logs.
+ */
+last_trigger_summary: string | null, };
 
 /**
  * Structured context generated at the end of each pipeline stage,

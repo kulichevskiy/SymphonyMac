@@ -218,6 +218,17 @@ pub struct AgentRun {
     /// PRs in Review forever.
     #[serde(default)]
     pub ci_status_fetch_failure_count: u32,
+    /// Signature of the trigger set used to spawn the most recent fix-run on
+    /// this Review run. Used by the stuck-loop escape: if two consecutive
+    /// fix-runs are about to fire with identical signatures, the agent is
+    /// going in circles and the run transitions to `AwaitingApproval` instead.
+    #[serde(default)]
+    pub last_trigger_signature: Option<String>,
+    /// Short, human-readable label describing the trigger that spawned the
+    /// most recent fix-run on this Review run (e.g. "Codex feedback",
+    /// "CI failure: build", "Conflict"). Surfaced in the dashboard Review card.
+    #[serde(default)]
+    pub last_trigger_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -247,6 +258,17 @@ pub struct RunSummary {
     pub pending_next_stage: Option<String>,
     #[serde(default)]
     pub review_iteration: u32,
+    /// Cumulative cost (USD) summed across every run for the same
+    /// (repo, issue) — surfaced on the dashboard Review card so operators can
+    /// see how close the run is to the cost cap.
+    #[serde(default)]
+    pub issue_cost_usd: f64,
+    /// Short summary of the trigger that fired the most recent fix-run on
+    /// this run (e.g. "Codex feedback", "CI failure: build", "Conflict").
+    /// Surfaced on the Review card so operators see the latest trigger
+    /// without opening the logs.
+    #[serde(default)]
+    pub last_trigger_summary: Option<String>,
 }
 
 impl From<&AgentRun> for RunSummary {
@@ -273,6 +295,10 @@ impl From<&AgentRun> for RunSummary {
             skipped_stages: run.skipped_stages.clone(),
             pending_next_stage: run.pending_next_stage.clone(),
             review_iteration: run.review_iteration,
+            // Default; `build_overview` recomputes this as a sum across every
+            // run for the same (repo, issue) using `cumulative_cost_for_issue`.
+            issue_cost_usd: 0.0,
+            last_trigger_summary: run.last_trigger_summary.clone(),
         }
     }
 }
@@ -370,6 +396,18 @@ pub struct RunConfig {
     /// Example: `aider --yes-always {{prompt}}`
     #[serde(default)]
     pub custom_agent_command: String,
+    /// Hard cap on review-loop fix-run iterations per Review run. When the
+    /// `review_iteration` counter reaches this value the next fix-run trigger
+    /// transitions the run to `AwaitingApproval` instead of spawning another
+    /// agent. Default 10. Set to 0 to disable the cap.
+    #[serde(default = "default_max_review_iterations")]
+    pub max_review_iterations: u32,
+    /// Cumulative cost cap (USD) summed across every run for the same
+    /// (repo, issue). When exceeded, the next fix-run trigger transitions the
+    /// Review run to `AwaitingApproval` instead of spawning another agent.
+    /// Default $5.00. Set to 0.0 to disable the cap.
+    #[serde(default = "default_cost_cap_per_issue_usd")]
+    pub cost_cap_per_issue_usd: f64,
 }
 
 fn default_priority_labels() -> Vec<String> {
@@ -398,6 +436,14 @@ fn default_codex_approve_patterns() -> Vec<String> {
 
 fn default_codex_feedback_marker() -> String {
     "Useful? React with 👍 / 👎.".to_string()
+}
+
+fn default_max_review_iterations() -> u32 {
+    10
+}
+
+fn default_cost_cap_per_issue_usd() -> f64 {
+    5.0
 }
 
 fn default_retry_base_delay() -> u64 {
@@ -436,6 +482,8 @@ impl Default for RunConfig {
             codex_feedback_marker: default_codex_feedback_marker(),
             local_repos: HashMap::new(),
             custom_agent_command: String::new(),
+            max_review_iterations: default_max_review_iterations(),
+            cost_cap_per_issue_usd: default_cost_cap_per_issue_usd(),
         }
     }
 }
@@ -456,11 +504,42 @@ pub struct OrchestratorOverview {
     pub total_runtime_secs: f64,
 }
 
+/// Sum `cost_usd` across every run for the given (repo, issue). Used by the
+/// review-loop cost-cap check, which only needs one figure per poll tick.
+/// `build_overview` does NOT call this — it pre-aggregates totals in a single
+/// pass to keep dashboard polling O(N) instead of O(N²).
+pub fn cumulative_cost_for_issue(state: &OrchestratorState, repo: &str, issue_number: u64) -> f64 {
+    state
+        .runs
+        .values()
+        .filter(|run| run.repo == repo && run.issue_number == issue_number)
+        .map(|run| run.cost_usd)
+        .sum()
+}
+
+/// Build a (repo, issue_number) → cumulative-cost map from the run map in a
+/// single pass. Equivalent to calling `cumulative_cost_for_issue` for every
+/// distinct (repo, issue) but O(N) instead of O(N²). Used by `build_overview`
+/// (one summary per run) and by the review-stage poll loop (one entry per
+/// running sentinel) so neither path re-scans `state.runs` per record while
+/// holding the orchestrator lock.
+pub(crate) fn aggregate_issue_costs(state: &OrchestratorState) -> HashMap<(String, u64), f64> {
+    let mut totals: HashMap<(String, u64), f64> = HashMap::new();
+    for run in state.runs.values() {
+        *totals
+            .entry((run.repo.clone(), run.issue_number))
+            .or_insert(0.0) += run.cost_usd;
+    }
+    totals
+}
+
 fn build_overview(state: &OrchestratorState) -> OrchestratorOverview {
     let mut runs = Vec::with_capacity(state.runs.len());
     let mut total_completed = 0;
     let mut total_failed = 0;
     let mut active_count = 0;
+
+    let issue_costs = aggregate_issue_costs(state);
 
     for run in state.runs.values() {
         if run.stage == PipelineStage::Done {
@@ -473,7 +552,12 @@ fn build_overview(state: &OrchestratorState) -> OrchestratorOverview {
             active_count += 1;
         }
 
-        runs.push(RunSummary::from(run));
+        let mut summary = RunSummary::from(run);
+        summary.issue_cost_usd = issue_costs
+            .get(&(run.repo.clone(), run.issue_number))
+            .copied()
+            .unwrap_or(0.0);
+        runs.push(summary);
     }
 
     OrchestratorOverview {
@@ -973,6 +1057,8 @@ mod tests {
             review_iteration: 0,
             last_ci_failure_sha: None,
             ci_status_fetch_failure_count: 0,
+            last_trigger_signature: None,
+            last_trigger_summary: None,
         }
     }
 
@@ -1073,6 +1159,8 @@ mod tests {
             review_iteration: 0,
             last_ci_failure_sha: None,
             ci_status_fetch_failure_count: 0,
+            last_trigger_signature: None,
+            last_trigger_summary: None,
         }
     }
 
@@ -1149,6 +1237,61 @@ mod tests {
             .expect("latest run");
 
         assert_eq!(latest.id, "run-late");
+    }
+
+    #[test]
+    fn test_aggregate_issue_costs_matches_per_issue_sum_in_single_pass() {
+        // Regression for the O(N²) hazard Codex flagged on PR #12: build_overview
+        // used to call `cumulative_cost_for_issue` once per run. The new
+        // single-pass aggregator must produce the same totals.
+        let mut state = OrchestratorState {
+            is_running: false,
+            repos: vec![],
+            runs: HashMap::new(),
+            config: RunConfig::default(),
+            agent_pids: HashMap::new(),
+            stop_flag: false,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_usd: 0.0,
+            total_runtime_secs: 0.0,
+        };
+
+        let make_at_cost = |id: &str, repo: &str, issue: u64, cost: f64| {
+            let mut run =
+                make_run(id, AgentStatus::Completed, PipelineStage::Implement);
+            run.repo = repo.to_string();
+            run.issue_number = issue;
+            run.cost_usd = cost;
+            run
+        };
+
+        for (id, repo, issue, cost) in [
+            ("a1", "kulichevskiy/SymphonyMac", 42_u64, 1.25_f64),
+            ("a2", "kulichevskiy/SymphonyMac", 42, 2.5),
+            ("b1", "kulichevskiy/SymphonyMac", 43, 7.0),
+            ("c1", "other/repo", 42, 9.0),
+        ] {
+            let run = make_at_cost(id, repo, issue, cost);
+            state.runs.insert(id.to_string(), run);
+        }
+
+        let aggregated = aggregate_issue_costs(&state);
+
+        // Aggregator must agree with per-issue calls that the loop used to make.
+        for ((repo, issue), expected) in aggregated.iter() {
+            let direct = cumulative_cost_for_issue(&state, repo, *issue);
+            assert!((direct - expected).abs() < f64::EPSILON);
+        }
+        assert!(
+            (aggregated[&("kulichevskiy/SymphonyMac".to_string(), 42)] - 3.75).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (aggregated[&("kulichevskiy/SymphonyMac".to_string(), 43)] - 7.0).abs()
+                < f64::EPSILON
+        );
+        assert!((aggregated[&("other/repo".to_string(), 42)] - 9.0).abs() < f64::EPSILON);
     }
 
     #[test]

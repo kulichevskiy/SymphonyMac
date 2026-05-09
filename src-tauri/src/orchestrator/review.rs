@@ -47,11 +47,32 @@ struct ReviewRunSnapshot {
     /// start of this poll tick. Used to decide whether a fresh fetch failure
     /// pushes us over the terminal-failure threshold.
     ci_status_fetch_failure_count: u32,
+    /// Signature of the trigger set used to spawn the most recent fix-run on
+    /// this run. Stuck-loop escape compares the next would-be trigger
+    /// signature to this value: equality means we're about to ask the agent to
+    /// fix the same thing twice and should halt instead.
+    last_trigger_signature: Option<String>,
+    /// Cumulative cost (USD) summed across every run for the same
+    /// (repo, issue), captured under-lock at the start of the poll tick. Used
+    /// for the cost-cap escape.
+    issue_cost_usd: f64,
+    /// Configured iteration cap captured under-lock at the start of the tick.
+    /// 0 disables the cap.
+    max_review_iterations: u32,
+    /// Configured cost cap captured under-lock at the start of the tick.
+    /// 0.0 disables the cap.
+    cost_cap_per_issue_usd: f64,
 }
 
 pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
     let (snapshots, approve_patterns, feedback_marker) = {
         let s = state.lock().await;
+        let max_review_iterations = s.config.max_review_iterations;
+        let cost_cap_per_issue_usd = s.config.cost_cap_per_issue_usd;
+        // Single-pass cost aggregation per poll tick. Reading from this map
+        // when filling each snapshot keeps the under-lock cost O(N) over the
+        // run table instead of O(R×N) where R = active review sentinels.
+        let issue_costs = crate::orchestrator::aggregate_issue_costs(&s);
         // Only the latest Running Review sentinel per (repo, issue) participates
         // in polling. Older Running sentinels (e.g. left over from a manual
         // re-launch) are silent. Without this dedupe, two sentinels for the
@@ -63,20 +84,30 @@ pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
         let snapshots: Vec<ReviewRunSnapshot> =
             latest_running_review_per_issue(s.runs.values())
                 .into_iter()
-                .map(|run| ReviewRunSnapshot {
-                    run_id: run.id.clone(),
-                    repo: run.repo.clone(),
-                    issue_number: run.issue_number,
-                    issue_title: run.issue_title.clone(),
-                    issue_body: String::new(),
-                    issue_labels: run.issue_labels.clone(),
-                    workspace_path: run.workspace_path.clone(),
-                    last_review_request_at: run.last_review_request_at.clone(),
-                    last_pushed_sha: run.last_pushed_sha.clone(),
-                    review_iteration: run.review_iteration,
-                    stage_context: run.stage_context.clone(),
-                    last_ci_failure_sha: run.last_ci_failure_sha.clone(),
-                    ci_status_fetch_failure_count: run.ci_status_fetch_failure_count,
+                .map(|run| {
+                    let issue_cost_usd = issue_costs
+                        .get(&(run.repo.clone(), run.issue_number))
+                        .copied()
+                        .unwrap_or(0.0);
+                    ReviewRunSnapshot {
+                        run_id: run.id.clone(),
+                        repo: run.repo.clone(),
+                        issue_number: run.issue_number,
+                        issue_title: run.issue_title.clone(),
+                        issue_body: String::new(),
+                        issue_labels: run.issue_labels.clone(),
+                        workspace_path: run.workspace_path.clone(),
+                        last_review_request_at: run.last_review_request_at.clone(),
+                        last_pushed_sha: run.last_pushed_sha.clone(),
+                        review_iteration: run.review_iteration,
+                        stage_context: run.stage_context.clone(),
+                        last_ci_failure_sha: run.last_ci_failure_sha.clone(),
+                        ci_status_fetch_failure_count: run.ci_status_fetch_failure_count,
+                        last_trigger_signature: run.last_trigger_signature.clone(),
+                        issue_cost_usd,
+                        max_review_iterations,
+                        cost_cap_per_issue_usd,
+                    }
                 })
                 .collect();
         (
@@ -427,6 +458,50 @@ permissions/auth and resume manually.",
     let branch_name = pr_state.head_ref_name.clone();
     let next_iteration = snapshot.review_iteration.saturating_add(1);
 
+    // Build the trigger signature + summary for this would-be fix-run. The
+    // signature feeds the dedup escape; the summary is shown on the dashboard.
+    let mut triggers: Vec<TriggerInput<'_>> = Vec::new();
+    for comment in &feedback_comments {
+        triggers.push(TriggerInput::CodexFeedback {
+            body: comment.body.as_str(),
+        });
+    }
+    for ctx in &ci_failure_contexts {
+        triggers.push(TriggerInput::CiFailure {
+            name: ctx.name.as_str(),
+        });
+    }
+    let next_signature = compute_trigger_signature(&triggers);
+    let next_summary = trigger_summary(&triggers);
+
+    if let Some(reason) = decide_escape(
+        snapshot.review_iteration,
+        snapshot.max_review_iterations,
+        snapshot.issue_cost_usd,
+        snapshot.cost_cap_per_issue_usd,
+        snapshot.last_trigger_signature.as_deref(),
+        &next_signature,
+        &next_summary,
+    ) {
+        // Persist the signature anyway so the dashboard can show what the
+        // escape was about, then park the run.
+        crate::agent::pipeline_helpers::set_last_trigger(
+            state,
+            &snapshot.run_id,
+            Some(next_signature),
+            Some(next_summary),
+        )
+        .await;
+        crate::agent::pipeline_helpers::escape_review_run_to_awaiting_approval(
+            app,
+            state,
+            &snapshot.run_id,
+            reason.human_message(),
+        )
+        .await;
+        return;
+    }
+
     let log_message = format!(
         "[review] Spawning fix-run iteration {}: {} Codex feedback comment{}, {} failing CI check{}.",
         next_iteration,
@@ -449,6 +524,13 @@ permissions/auth and resume manually.",
         state,
         &snapshot.run_id,
         next_iteration,
+    )
+    .await;
+    crate::agent::pipeline_helpers::set_last_trigger(
+        state,
+        &snapshot.run_id,
+        Some(next_signature),
+        Some(next_summary),
     )
     .await;
     if should_spawn_for_ci {
@@ -555,6 +637,39 @@ async fn try_dispatch_rebase_fix_run(
     let conflicting_files = pr_state.files.clone();
     let next_iteration = snapshot.review_iteration.saturating_add(1);
 
+    let triggers = vec![TriggerInput::Rebase {
+        base_branch: base_branch.as_str(),
+        conflicting_files: &conflicting_files,
+    }];
+    let next_signature = compute_trigger_signature(&triggers);
+    let next_summary = trigger_summary(&triggers);
+
+    if let Some(reason) = decide_escape(
+        snapshot.review_iteration,
+        snapshot.max_review_iterations,
+        snapshot.issue_cost_usd,
+        snapshot.cost_cap_per_issue_usd,
+        snapshot.last_trigger_signature.as_deref(),
+        &next_signature,
+        &next_summary,
+    ) {
+        crate::agent::pipeline_helpers::set_last_trigger(
+            state,
+            &snapshot.run_id,
+            Some(next_signature),
+            Some(next_summary),
+        )
+        .await;
+        crate::agent::pipeline_helpers::escape_review_run_to_awaiting_approval(
+            app,
+            state,
+            &snapshot.run_id,
+            reason.human_message(),
+        )
+        .await;
+        return;
+    }
+
     let log_message = format!(
         "[review] PR mergeStateStatus=DIRTY ({} file{} touched). Spawning rebase fix-run iteration {} against base `{}`.",
         conflicting_files.len(),
@@ -567,6 +682,13 @@ async fn try_dispatch_rebase_fix_run(
         state,
         &snapshot.run_id,
         next_iteration,
+    )
+    .await;
+    crate::agent::pipeline_helpers::set_last_trigger(
+        state,
+        &snapshot.run_id,
+        Some(next_signature),
+        Some(next_summary),
     )
     .await;
     crate::agent::pipeline_helpers::mark_review_run_dispatching_fix_run(
@@ -795,6 +917,177 @@ fn another_review_active(
         && matches!(candidate_status, AgentStatus::Preparing)
 }
 
+/// Trigger flavours that can fire a Review-stage fix-run. The escape logic
+/// uses these to build a signature: if two consecutive fix-runs have the
+/// identical (sorted) trigger set, the agent is going in circles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TriggerInput<'a> {
+    /// Codex left review feedback. The body string is hashed (truncated) so
+    /// the same comment text always produces the same signature.
+    CodexFeedback { body: &'a str },
+    /// A required CI check is failing. Keyed by check name — the same workflow
+    /// failing again on a new SHA matches the prior signature, which is the
+    /// circular-fix behavior the dedup is meant to catch.
+    CiFailure { name: &'a str },
+    /// PR is in DIRTY mergeStateStatus. Conflicting file set is used so that
+    /// rebasing twice against the same conflict surface is recognised as a loop.
+    Rebase {
+        base_branch: &'a str,
+        conflicting_files: &'a [String],
+    },
+}
+
+/// Truncated FNV-1a hash of `body`. Stable, fast, and only used to
+/// fingerprint comment bodies inside trigger signatures — not security-critical.
+fn fingerprint(body: &str) -> String {
+    // FNV-1a 64-bit. We render only the lower 8 hex digits to keep the
+    // signature short; collisions on short hashes are acceptable here because
+    // the only consequence is a false-positive escape, which the operator can
+    // override.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in body.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", (hash & 0xffff_ffff) as u32)
+}
+
+/// Build a stable signature string from the next fix-run's trigger set. Used
+/// to detect the "two consecutive fix-runs with identical triggers" loop.
+pub(crate) fn compute_trigger_signature(triggers: &[TriggerInput<'_>]) -> String {
+    let mut parts: Vec<String> = triggers
+        .iter()
+        .map(|trigger| match trigger {
+            TriggerInput::CodexFeedback { body } => format!("codex:{}", fingerprint(body)),
+            TriggerInput::CiFailure { name } => format!("ci:{}", name),
+            TriggerInput::Rebase {
+                base_branch,
+                conflicting_files,
+            } => {
+                let mut files: Vec<&str> =
+                    conflicting_files.iter().map(String::as_str).collect();
+                files.sort_unstable();
+                format!("rebase:{}|{}", base_branch, files.join(","))
+            }
+        })
+        .collect();
+    parts.sort_unstable();
+    parts.dedup();
+    parts.join(";")
+}
+
+/// Short, human-readable label describing the trigger set for the dashboard.
+/// Matches the rough shape `Codex feedback`, `CI failure: build`, `Conflict`.
+pub(crate) fn trigger_summary(triggers: &[TriggerInput<'_>]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut codex_count = 0usize;
+    let mut ci_names: Vec<&str> = Vec::new();
+    let mut had_rebase = false;
+    for trigger in triggers {
+        match trigger {
+            TriggerInput::CodexFeedback { .. } => codex_count += 1,
+            TriggerInput::CiFailure { name } => ci_names.push(name),
+            TriggerInput::Rebase { .. } => had_rebase = true,
+        }
+    }
+    if codex_count > 0 {
+        parts.push(if codex_count == 1 {
+            "Codex feedback".to_string()
+        } else {
+            format!("Codex feedback ({})", codex_count)
+        });
+    }
+    if !ci_names.is_empty() {
+        ci_names.sort_unstable();
+        ci_names.dedup();
+        parts.push(format!("CI failure: {}", ci_names.join(", ")));
+    }
+    if had_rebase {
+        parts.push("Conflict".to_string());
+    }
+    if parts.is_empty() {
+        "Unknown trigger".to_string()
+    } else {
+        parts.join(" + ")
+    }
+}
+
+/// Reasons a Review run can escape into `AwaitingApproval` instead of
+/// spawning yet another fix-run. Surfaced verbatim in the run log and
+/// notification body so operators see *why* the loop halted.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum EscapeReason {
+    /// `review_iteration` is at or above the configured cap.
+    IterationCap { iterations: u32, cap: u32 },
+    /// Cumulative cost across every run for this issue exceeds the cap.
+    CostCap {
+        cost_usd: f64,
+        cap_usd: f64,
+    },
+    /// The next would-be trigger signature exactly matches the prior one —
+    /// the agent is being asked to fix the same thing twice.
+    SignatureDedup { signature: String, summary: String },
+}
+
+impl EscapeReason {
+    pub(crate) fn human_message(&self) -> String {
+        match self {
+            EscapeReason::IterationCap { iterations, cap } => format!(
+                "review iteration cap reached ({}/{})",
+                iterations, cap
+            ),
+            EscapeReason::CostCap { cost_usd, cap_usd } => format!(
+                "cost cap exceeded for this issue (${:.2} > ${:.2})",
+                cost_usd, cap_usd
+            ),
+            EscapeReason::SignatureDedup { summary, .. } => format!(
+                "two consecutive fix-runs with identical triggers ({}) — agent is looping",
+                summary
+            ),
+        }
+    }
+}
+
+/// Decide whether the next fix-run should escape to AwaitingApproval before
+/// spawning. `iterations_so_far` is the run's current `review_iteration`
+/// counter (i.e. the number of fix-runs that already ran), `next_signature`
+/// is the signature of the about-to-fire trigger set.
+///
+/// Returns the first matching reason in priority order: iteration → cost →
+/// signature dedup. Iteration and cost are deterministic environment limits
+/// and outrank the signature heuristic.
+pub(crate) fn decide_escape(
+    iterations_so_far: u32,
+    iteration_cap: u32,
+    cumulative_cost_usd: f64,
+    cost_cap_usd: f64,
+    last_signature: Option<&str>,
+    next_signature: &str,
+    next_summary: &str,
+) -> Option<EscapeReason> {
+    if iteration_cap > 0 && iterations_so_far >= iteration_cap {
+        return Some(EscapeReason::IterationCap {
+            iterations: iterations_so_far,
+            cap: iteration_cap,
+        });
+    }
+    if cost_cap_usd > 0.0 && cumulative_cost_usd > cost_cap_usd {
+        return Some(EscapeReason::CostCap {
+            cost_usd: cumulative_cost_usd,
+            cap_usd: cost_cap_usd,
+        });
+    }
+    if let Some(prior) = last_signature {
+        if !prior.is_empty() && prior == next_signature {
+            return Some(EscapeReason::SignatureDedup {
+                signature: next_signature.to_string(),
+                summary: next_summary.to_string(),
+            });
+        }
+    }
+    None
+}
+
 /// Returns true when the PR's current HEAD matches the SHA we recorded at the
 /// time we asked Codex to review. If we don't have a recorded SHA (e.g. a legacy
 /// run from before this field existed) or we don't know the PR HEAD, we accept —
@@ -1020,6 +1313,8 @@ mod tests {
             review_iteration: 0,
             last_ci_failure_sha: None,
             ci_status_fetch_failure_count: 0,
+            last_trigger_signature: None,
+            last_trigger_summary: None,
         }
     }
 
@@ -1274,5 +1569,243 @@ mod tests {
         assert!(separator_pos < second_pos);
         assert!(combined.contains("Comment 1"));
         assert!(combined.contains("Comment 2"));
+    }
+
+    // ─── Stuck-loop escape tests (issue #6) ───────────────────────────
+
+    #[test]
+    fn compute_trigger_signature_is_deterministic_and_order_independent() {
+        // Same trigger set in different order produces the same signature so
+        // the dedup is robust to the order Codex/CI report in.
+        let body_a = "first concern";
+        let body_b = "second concern";
+        let files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let triggers_a = vec![
+            TriggerInput::CodexFeedback { body: body_a },
+            TriggerInput::CiFailure { name: "build" },
+            TriggerInput::Rebase {
+                base_branch: "main",
+                conflicting_files: &files,
+            },
+            TriggerInput::CodexFeedback { body: body_b },
+        ];
+        let triggers_b = vec![
+            TriggerInput::CiFailure { name: "build" },
+            TriggerInput::CodexFeedback { body: body_b },
+            TriggerInput::CodexFeedback { body: body_a },
+            TriggerInput::Rebase {
+                base_branch: "main",
+                conflicting_files: &files,
+            },
+        ];
+
+        assert_eq!(
+            compute_trigger_signature(&triggers_a),
+            compute_trigger_signature(&triggers_b)
+        );
+    }
+
+    #[test]
+    fn compute_trigger_signature_distinguishes_different_comment_bodies() {
+        // Different feedback text must produce different signatures —
+        // otherwise we'd incorrectly dedupe genuine new feedback.
+        let triggers_a = vec![TriggerInput::CodexFeedback {
+            body: "missing test for edge case",
+        }];
+        let triggers_b = vec![TriggerInput::CodexFeedback {
+            body: "rename function for clarity",
+        }];
+        assert_ne!(
+            compute_trigger_signature(&triggers_a),
+            compute_trigger_signature(&triggers_b)
+        );
+    }
+
+    #[test]
+    fn decide_escape_returns_iteration_cap_when_counter_at_or_above_limit() {
+        let next_signature = "codex:abc";
+        let result = decide_escape(10, 10, 0.0, 0.0, None, next_signature, "Codex feedback");
+        assert!(matches!(
+            result,
+            Some(EscapeReason::IterationCap { iterations: 10, cap: 10 })
+        ));
+
+        // Same with counter strictly above.
+        let result = decide_escape(15, 10, 0.0, 0.0, None, next_signature, "Codex feedback");
+        assert!(matches!(
+            result,
+            Some(EscapeReason::IterationCap { iterations: 15, cap: 10 })
+        ));
+    }
+
+    #[test]
+    fn decide_escape_iteration_cap_zero_disables_check() {
+        // cap=0 means "disabled" — even a high iteration count must not
+        // escape via this path.
+        let result = decide_escape(99, 0, 0.0, 0.0, None, "sig", "Codex feedback");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn decide_escape_returns_cost_cap_when_cumulative_cost_exceeds_cap() {
+        let result = decide_escape(0, 100, 5.01, 5.0, None, "sig", "Codex feedback");
+        match result {
+            Some(EscapeReason::CostCap { cost_usd, cap_usd }) => {
+                assert!((cost_usd - 5.01).abs() < f64::EPSILON);
+                assert!((cap_usd - 5.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected CostCap, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decide_escape_cost_cap_zero_or_equal_does_not_fire() {
+        // Cap=0.0 → disabled, even with non-zero cost.
+        assert!(decide_escape(0, 100, 99.0, 0.0, None, "sig", "x").is_none());
+        // Cost equal to cap → not strictly greater, so does not fire.
+        assert!(decide_escape(0, 100, 5.0, 5.0, None, "sig", "x").is_none());
+    }
+
+    #[test]
+    fn decide_escape_returns_signature_dedup_when_signatures_match() {
+        let signature = "codex:abc;ci:build";
+        let result = decide_escape(
+            1,
+            100,
+            0.0,
+            0.0,
+            Some(signature),
+            signature,
+            "Codex feedback",
+        );
+        assert!(matches!(result, Some(EscapeReason::SignatureDedup { .. })));
+    }
+
+    #[test]
+    fn decide_escape_signature_dedup_does_not_fire_when_signatures_differ() {
+        let result = decide_escape(
+            1,
+            100,
+            0.0,
+            0.0,
+            Some("codex:aaa"),
+            "codex:bbb",
+            "Codex feedback",
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn decide_escape_signature_dedup_does_not_fire_on_first_iteration() {
+        // No prior signature → never dedup.
+        let result = decide_escape(
+            0,
+            100,
+            0.0,
+            0.0,
+            None,
+            "codex:abc",
+            "Codex feedback",
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn decide_escape_priority_iteration_then_cost_then_signature() {
+        // All three triggers fire; iteration cap should win because it's the
+        // most deterministic.
+        let signature = "codex:abc";
+        let result = decide_escape(
+            10,
+            10,
+            10.0,
+            5.0,
+            Some(signature),
+            signature,
+            "Codex feedback",
+        );
+        assert!(matches!(result, Some(EscapeReason::IterationCap { .. })));
+
+        // Without the iteration cap (set to 0), cost should win over signature.
+        let result = decide_escape(
+            10,
+            0,
+            10.0,
+            5.0,
+            Some(signature),
+            signature,
+            "Codex feedback",
+        );
+        assert!(matches!(result, Some(EscapeReason::CostCap { .. })));
+    }
+
+    #[test]
+    fn trigger_summary_renders_all_kinds() {
+        let files = vec!["a.rs".to_string()];
+        let triggers = vec![
+            TriggerInput::CodexFeedback { body: "x" },
+            TriggerInput::CodexFeedback { body: "y" },
+            TriggerInput::CiFailure { name: "build" },
+            TriggerInput::Rebase {
+                base_branch: "main",
+                conflicting_files: &files,
+            },
+        ];
+        let summary = trigger_summary(&triggers);
+        assert!(summary.contains("Codex feedback (2)"));
+        assert!(summary.contains("CI failure: build"));
+        assert!(summary.contains("Conflict"));
+    }
+
+    fn make_run_with_cost(
+        repo: &str,
+        issue_number: u64,
+        cost: f64,
+    ) -> crate::orchestrator::AgentRun {
+        let mut run = make_review_run("run", issue_number, AgentStatus::Completed, "2026-05-09T10:00:00Z");
+        run.repo = repo.to_string();
+        run.cost_usd = cost;
+        run
+    }
+
+    #[test]
+    fn cumulative_cost_for_issue_sums_all_runs_for_same_issue_only() {
+        use std::collections::HashMap;
+
+        let mut state = crate::orchestrator::OrchestratorState {
+            is_running: false,
+            repos: vec![],
+            runs: HashMap::new(),
+            config: crate::orchestrator::RunConfig::default(),
+            agent_pids: HashMap::new(),
+            stop_flag: false,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_usd: 0.0,
+            total_runtime_secs: 0.0,
+        };
+
+        let mut a1 = make_run_with_cost("kulichevskiy/SymphonyMac", 42, 1.25);
+        a1.id = "a1".to_string();
+        let mut a2 = make_run_with_cost("kulichevskiy/SymphonyMac", 42, 2.5);
+        a2.id = "a2".to_string();
+        // Different issue — must NOT be summed.
+        let mut b1 = make_run_with_cost("kulichevskiy/SymphonyMac", 43, 7.0);
+        b1.id = "b1".to_string();
+        // Different repo — must NOT be summed.
+        let mut c1 = make_run_with_cost("other/repo", 42, 9.0);
+        c1.id = "c1".to_string();
+
+        state.runs.insert(a1.id.clone(), a1);
+        state.runs.insert(a2.id.clone(), a2);
+        state.runs.insert(b1.id.clone(), b1);
+        state.runs.insert(c1.id.clone(), c1);
+
+        let total = crate::orchestrator::cumulative_cost_for_issue(
+            &state,
+            "kulichevskiy/SymphonyMac",
+            42,
+        );
+        assert!((total - 3.75).abs() < f64::EPSILON);
     }
 }
