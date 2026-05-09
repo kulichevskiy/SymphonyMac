@@ -418,6 +418,10 @@ pub(crate) async fn run_agent_process(
         )
         .await
         {
+            // The agent itself succeeded but the post-push step (re-posting
+            // `@codex review` or refreshing PR HEAD) failed — surface that as
+            // a stage failure with the same notification/cleanup treatment as
+            // any other exhausted failure, so it isn't silently swallowed.
             let mut emit_extra = Map::new();
             emit_extra.insert("error".to_string(), json!(error.clone()));
             let _ = runtime::transition_run(
@@ -436,6 +440,8 @@ pub(crate) async fn run_agent_process(
                 },
             )
             .await;
+            handle_failed_attempt(&app, &state, &request, &stage_label).await;
+            return;
         }
         runtime::update_dock_badge(&state).await;
         return;
