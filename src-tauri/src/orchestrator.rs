@@ -504,9 +504,10 @@ pub struct OrchestratorOverview {
     pub total_runtime_secs: f64,
 }
 
-/// Sum `cost_usd` across every run for the given (repo, issue). Used both by
-/// the review-loop cost-cap check and by `build_overview` so the dashboard
-/// shows the same number the cap is measured against.
+/// Sum `cost_usd` across every run for the given (repo, issue). Used by the
+/// review-loop cost-cap check, which only needs one figure per poll tick.
+/// `build_overview` does NOT call this — it pre-aggregates totals in a single
+/// pass to keep dashboard polling O(N) instead of O(N²).
 pub fn cumulative_cost_for_issue(state: &OrchestratorState, repo: &str, issue_number: u64) -> f64 {
     state
         .runs
@@ -516,11 +517,28 @@ pub fn cumulative_cost_for_issue(state: &OrchestratorState, repo: &str, issue_nu
         .sum()
 }
 
+/// Build a (repo, issue_number) → cumulative-cost map from the run map in a
+/// single pass. Equivalent to calling `cumulative_cost_for_issue` for every
+/// distinct (repo, issue) but O(N) instead of O(N²) — required for
+/// `build_overview` because it produces one `RunSummary` per run and would
+/// otherwise rescan `state.runs` for each one.
+fn aggregate_issue_costs(state: &OrchestratorState) -> HashMap<(String, u64), f64> {
+    let mut totals: HashMap<(String, u64), f64> = HashMap::new();
+    for run in state.runs.values() {
+        *totals
+            .entry((run.repo.clone(), run.issue_number))
+            .or_insert(0.0) += run.cost_usd;
+    }
+    totals
+}
+
 fn build_overview(state: &OrchestratorState) -> OrchestratorOverview {
     let mut runs = Vec::with_capacity(state.runs.len());
     let mut total_completed = 0;
     let mut total_failed = 0;
     let mut active_count = 0;
+
+    let issue_costs = aggregate_issue_costs(state);
 
     for run in state.runs.values() {
         if run.stage == PipelineStage::Done {
@@ -534,7 +552,10 @@ fn build_overview(state: &OrchestratorState) -> OrchestratorOverview {
         }
 
         let mut summary = RunSummary::from(run);
-        summary.issue_cost_usd = cumulative_cost_for_issue(state, &run.repo, run.issue_number);
+        summary.issue_cost_usd = issue_costs
+            .get(&(run.repo.clone(), run.issue_number))
+            .copied()
+            .unwrap_or(0.0);
         runs.push(summary);
     }
 
@@ -1215,6 +1236,61 @@ mod tests {
             .expect("latest run");
 
         assert_eq!(latest.id, "run-late");
+    }
+
+    #[test]
+    fn test_aggregate_issue_costs_matches_per_issue_sum_in_single_pass() {
+        // Regression for the O(N²) hazard Codex flagged on PR #12: build_overview
+        // used to call `cumulative_cost_for_issue` once per run. The new
+        // single-pass aggregator must produce the same totals.
+        let mut state = OrchestratorState {
+            is_running: false,
+            repos: vec![],
+            runs: HashMap::new(),
+            config: RunConfig::default(),
+            agent_pids: HashMap::new(),
+            stop_flag: false,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_usd: 0.0,
+            total_runtime_secs: 0.0,
+        };
+
+        let make_at_cost = |id: &str, repo: &str, issue: u64, cost: f64| {
+            let mut run =
+                make_run(id, AgentStatus::Completed, PipelineStage::Implement);
+            run.repo = repo.to_string();
+            run.issue_number = issue;
+            run.cost_usd = cost;
+            run
+        };
+
+        for (id, repo, issue, cost) in [
+            ("a1", "kulichevskiy/SymphonyMac", 42_u64, 1.25_f64),
+            ("a2", "kulichevskiy/SymphonyMac", 42, 2.5),
+            ("b1", "kulichevskiy/SymphonyMac", 43, 7.0),
+            ("c1", "other/repo", 42, 9.0),
+        ] {
+            let run = make_at_cost(id, repo, issue, cost);
+            state.runs.insert(id.to_string(), run);
+        }
+
+        let aggregated = aggregate_issue_costs(&state);
+
+        // Aggregator must agree with per-issue calls that the loop used to make.
+        for ((repo, issue), expected) in aggregated.iter() {
+            let direct = cumulative_cost_for_issue(&state, repo, *issue);
+            assert!((direct - expected).abs() < f64::EPSILON);
+        }
+        assert!(
+            (aggregated[&("kulichevskiy/SymphonyMac".to_string(), 42)] - 3.75).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (aggregated[&("kulichevskiy/SymphonyMac".to_string(), 43)] - 7.0).abs()
+                < f64::EPSILON
+        );
+        assert!((aggregated[&("other/repo".to_string(), 42)] - 9.0).abs() < f64::EPSILON);
     }
 
     #[test]
