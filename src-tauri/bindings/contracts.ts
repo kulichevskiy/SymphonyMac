@@ -46,7 +46,17 @@ stage_context: StageContext | null,
 /**
  * The next stage to advance to when approval is granted (only set when status is AwaitingApproval)
  */
-pending_next_stage: string | null, };
+pending_next_stage: string | null, 
+/**
+ * HEAD SHA captured when the Review stage was last (re-)requested.
+ * Used to ignore stale Codex feedback on prior commits.
+ */
+last_pushed_sha: string | null, 
+/**
+ * RFC3339 timestamp of when `@codex review` was last posted for this run.
+ * Comments before this timestamp are ignored when checking for approval.
+ */
+last_review_request_at: string | null, };
 
 export type AgentStatus = "preparing" | "running" | "completed" | "failed" | "stopped" | "interrupted" | "awaiting_approval";
 
@@ -82,9 +92,9 @@ export type LocalRepoInfo = { path: string, full_name: string, };
 
 export type OrchestratorOverview = { is_running: boolean, repos: Array<string>, runs: Array<RunSummary>, config: RunConfig, total_completed: number, total_failed: number, active_count: number, total_input_tokens: bigint, total_output_tokens: bigint, total_cost_usd: number, total_runtime_secs: number, };
 
-export type PipelineReport = { issue_number: bigint, issue_title: string, repo: string, total_duration_secs: bigint, total_duration_display: string, stages: Array<StageReport>, pr_number: bigint | null, pr_url: string | null, issue_url: string, code_review_summary: string, testing_summary: string, total_input_tokens: bigint, total_output_tokens: bigint, total_cost_usd: number, };
+export type PipelineReport = { issue_number: bigint, issue_title: string, repo: string, total_duration_secs: bigint, total_duration_display: string, stages: Array<StageReport>, pr_number: bigint | null, pr_url: string | null, issue_url: string, review_summary: string, total_input_tokens: bigint, total_output_tokens: bigint, total_cost_usd: number, };
 
-export type PipelineStage = "implement" | "code_review" | "testing" | "merge" | "done";
+export type PipelineStage = "implement" | "review" | "merge" | "done";
 
 export type Repo = { full_name: string, name: string, owner: string, description: string | null, url: string, default_branch: string, is_private: boolean, };
 
@@ -103,19 +113,23 @@ priority_labels: Array<string>,
  */
 stall_timeout_secs: bigint, 
 /**
- * Label-to-stage skip mappings. When an issue has a label matching a key,
- * the listed stages are skipped during auto-chaining.
- * Only CodeReview and Testing can be skipped; Implement and Merge are always required.
- * Default: {"skip:code-review": ["code_review"], "skip:testing": ["testing"], "docs-only": ["code_review", "testing"]}
- */
-stage_skip_labels: { [key in string]: Array<string> }, 
-/**
  * Per-stage approval gates. When a gate is enabled for a stage, the pipeline
  * pauses after that stage completes and waits for explicit user approval before
- * advancing to the next stage. Keys are stage names (implement, code_review,
- * testing, merge). Default: all false (fully automatic).
+ * advancing to the next stage. Keys are stage names (implement, review, merge).
+ * Default: all false (fully automatic).
  */
 approval_gates: { [key in string]: boolean }, 
+/**
+ * Substrings (case-insensitive) that mark a Codex review comment as approving.
+ * When one of these appears in a Codex bot comment newer than `last_review_request_at`,
+ * the Review stage advances to Merge.
+ */
+codex_approve_patterns: Array<string>, 
+/**
+ * Trailing marker Codex appends to its review comments (used as a heuristic for
+ * identifying review summary comments rather than chatter).
+ */
+codex_feedback_marker: string, 
 /**
  * Local repository paths. Keys are repo full names (e.g. "owner/repo"),
  * values are absolute paths to local git repositories. When a repo has a

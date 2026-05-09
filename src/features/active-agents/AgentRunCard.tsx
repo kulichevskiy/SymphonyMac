@@ -5,16 +5,14 @@ import type { LiveLogEntry, LogFilter } from "./types";
 
 const STAGE_LABELS: Record<string, string> = {
   implement: "Implement",
-  code_review: "Code Review",
-  testing: "Testing",
+  review: "Review",
   merge: "Merge",
   done: "Done",
 };
 
 const STAGE_COLORS: Record<string, string> = {
   implement: "#d29922",
-  code_review: "#bc8cff",
-  testing: "#58a6ff",
+  review: "#bc8cff",
   merge: "#d2a8ff",
   done: "#3fb950",
 };
@@ -31,7 +29,7 @@ const ACTIVITY_ICONS: Record<string, string> = {
   Completed: "\u{2705}",
 };
 
-const STAGES = ["implement", "code_review", "testing", "merge", "done"];
+const STAGES = ["implement", "review", "merge", "done"];
 
 interface AgentRunCardProps {
   run: AgentRun;

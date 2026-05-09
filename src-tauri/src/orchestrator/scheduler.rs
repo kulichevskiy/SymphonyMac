@@ -10,7 +10,6 @@ pub struct SchedulerConfig {
     pub max_concurrent: usize,
     pub stage_limits: HashMap<String, usize>,
     pub priority_labels: Vec<String>,
-    pub skip_labels: HashMap<String, Vec<String>>,
 }
 
 impl From<&RunConfig> for SchedulerConfig {
@@ -19,7 +18,6 @@ impl From<&RunConfig> for SchedulerConfig {
             max_concurrent: config.max_concurrent,
             stage_limits: config.max_concurrent_by_stage.clone(),
             priority_labels: config.priority_labels.clone(),
-            skip_labels: config.stage_skip_labels.clone(),
         }
     }
 }
@@ -83,44 +81,18 @@ pub struct ScheduleOutcome {
     pub all_issues_accounted_for: bool,
 }
 
-/// Given an issue's labels and the configured skip-label mappings, return the
-/// list of pipeline stages that should be skipped for this issue.
-/// Only CodeReview and Testing can be skipped.
-pub fn compute_skipped_stages(
-    issue_labels: &[String],
-    skip_labels: &HashMap<String, Vec<String>>,
-) -> Vec<PipelineStage> {
-    let mut skipped = Vec::new();
-    for label in issue_labels {
-        let label_lower = label.to_lowercase();
-        for (skip_label, stages) in skip_labels {
-            if label_lower == skip_label.to_lowercase() {
-                for stage_name in stages {
-                    let stage = match stage_name.as_str() {
-                        "code_review" => PipelineStage::CodeReview,
-                        "testing" => PipelineStage::Testing,
-                        _ => continue,
-                    };
-                    if !skipped.contains(&stage) {
-                        skipped.push(stage);
-                    }
-                }
-            }
-        }
-    }
-    skipped
-}
-
 /// Return the next pipeline stage after `current`, skipping any stages in `skipped`.
 /// Returns None if there is no next stage.
+///
+/// `skipped` is retained for API compatibility with prior callers; the new
+/// 3-stage pipeline (`Implement → Review → Merge`) has no skippable stages.
 pub fn next_pipeline_stage(
     current: &PipelineStage,
     skipped: &[PipelineStage],
 ) -> Option<PipelineStage> {
     let chain = [
         PipelineStage::Implement,
-        PipelineStage::CodeReview,
-        PipelineStage::Testing,
+        PipelineStage::Review,
         PipelineStage::Merge,
     ];
     let current_idx = chain.iter().position(|stage| stage == current)?;
@@ -192,7 +164,7 @@ pub fn plan_dispatch(
             continue;
         }
 
-        let launch = build_launch_decision(&issue_snapshot, &config.skip_labels);
+        let launch = build_launch_decision(&issue_snapshot);
         if stage_has_capacity(
             &runtime.active_by_stage,
             &stage_slots_used,
@@ -219,13 +191,9 @@ pub fn plan_dispatch(
     }
 }
 
-fn build_launch_decision(
-    issue_snapshot: &IssueSnapshot,
-    skip_labels: &HashMap<String, Vec<String>>,
-) -> LaunchDecision {
-    let skipped = compute_skipped_stages(&issue_snapshot.issue.labels, skip_labels);
+fn build_launch_decision(issue_snapshot: &IssueSnapshot) -> LaunchDecision {
     let (stage, issue_title, issue_body) = match issue_snapshot.pull_request.as_ref() {
-        Some(pr) => build_pr_launch_context(pr, &skipped),
+        Some(pr) => build_pr_launch_context(pr),
         None => (
             PipelineStage::Implement,
             issue_snapshot.issue.title.clone(),
@@ -243,18 +211,9 @@ fn build_launch_decision(
     }
 }
 
-fn build_pr_launch_context(
-    pull_request: &PullRequest,
-    skipped: &[PipelineStage],
-) -> (PipelineStage, String, String) {
-    let mut start_stage = PipelineStage::CodeReview;
-    if skipped.contains(&start_stage) {
-        start_stage =
-            next_pipeline_stage(&PipelineStage::Implement, skipped).unwrap_or(PipelineStage::Merge);
-    }
-
+fn build_pr_launch_context(pull_request: &PullRequest) -> (PipelineStage, String, String) {
     (
-        start_stage,
+        PipelineStage::Review,
         pull_request.title.clone(),
         pull_request.body.clone().unwrap_or_default(),
     )
@@ -369,19 +328,6 @@ mod tests {
                 "priority:medium".to_string(),
                 "priority:low".to_string(),
             ],
-            skip_labels: {
-                let mut labels = HashMap::new();
-                labels.insert(
-                    "skip:code-review".to_string(),
-                    vec!["code_review".to_string()],
-                );
-                labels.insert("skip:testing".to_string(), vec!["testing".to_string()]);
-                labels.insert(
-                    "docs-only".to_string(),
-                    vec!["code_review".to_string(), "testing".to_string()],
-                );
-                labels
-            },
         }
     }
 
@@ -413,32 +359,16 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_skipped_stages_cannot_skip_implement_or_merge() {
-        let mut skip_labels = HashMap::new();
-        skip_labels.insert(
-            "skip-all".to_string(),
-            vec![
-                "implement".to_string(),
-                "code_review".to_string(),
-                "testing".to_string(),
-                "merge".to_string(),
-            ],
-        );
-
-        let skipped = compute_skipped_stages(&["skip-all".to_string()], &skip_labels);
+    fn test_next_pipeline_stage_advances_implement_to_review_to_merge() {
         assert_eq!(
-            skipped,
-            vec![PipelineStage::CodeReview, PipelineStage::Testing]
+            next_pipeline_stage(&PipelineStage::Implement, &[]),
+            Some(PipelineStage::Review)
         );
-    }
-
-    #[test]
-    fn test_next_pipeline_stage_skips_review_and_testing() {
-        let skipped = vec![PipelineStage::CodeReview, PipelineStage::Testing];
         assert_eq!(
-            next_pipeline_stage(&PipelineStage::Implement, &skipped),
+            next_pipeline_stage(&PipelineStage::Review, &[]),
             Some(PipelineStage::Merge)
         );
+        assert_eq!(next_pipeline_stage(&PipelineStage::Merge, &[]), None);
     }
 
     #[test]
@@ -488,8 +418,8 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_dispatch_uses_skip_labels_when_pr_already_exists() {
-        let mut issue = make_snapshot_issue(20, vec!["skip:code-review"], "2024-01-01T00:00:00Z");
+    fn test_plan_dispatch_starts_review_when_pr_already_exists() {
+        let mut issue = make_snapshot_issue(20, vec![], "2024-01-01T00:00:00Z");
         issue.pull_request = Some(make_pr(20, "Fix #20: Existing PR"));
 
         let snapshot = RepositorySnapshot {
@@ -500,7 +430,7 @@ mod tests {
         let outcome = plan_dispatch(&snapshot, &RuntimeSnapshot::default(), &base_config());
 
         assert_eq!(outcome.launches.len(), 1);
-        assert_eq!(outcome.launches[0].stage, PipelineStage::Testing);
+        assert_eq!(outcome.launches[0].stage, PipelineStage::Review);
         assert_eq!(outcome.launches[0].issue_title, "Fix #20: Existing PR");
     }
 
@@ -519,13 +449,13 @@ mod tests {
         runtime.active_count = 1;
         runtime
             .active_by_stage
-            .insert(PipelineStage::CodeReview.to_string(), 1);
+            .insert(PipelineStage::Review.to_string(), 1);
 
         let mut config = base_config();
         config.max_concurrent = 3;
         config
             .stage_limits
-            .insert(PipelineStage::CodeReview.to_string(), 1);
+            .insert(PipelineStage::Review.to_string(), 1);
 
         let outcome = plan_dispatch(&snapshot, &runtime, &config);
 

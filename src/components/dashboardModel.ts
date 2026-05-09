@@ -60,10 +60,9 @@ export interface DashboardColumn {
 const COLUMN_META = [
   { id: "open", title: "Open", color: "#8b949e" },
   { id: "blocked", title: "Blocked", color: "#da3633" },
-  { id: "implement", title: "In Progress", color: "#d29922" },
-  { id: "review", title: "Code Review", color: "#bc8cff" },
-  { id: "testing", title: "Testing", color: "#58a6ff" },
-  { id: "merge", title: "Merging", color: "#d2a8ff" },
+  { id: "implement", title: "Implement", color: "#d29922" },
+  { id: "review", title: "Review", color: "#bc8cff" },
+  { id: "merge", title: "Merge", color: "#d2a8ff" },
   { id: "approval", title: "Awaiting Approval", color: "#d29922" },
   { id: "done", title: "Done", color: "#3fb950" },
   { id: "failed", title: "Failed", color: "#f85149" },
@@ -202,7 +201,6 @@ export function buildDashboardColumns({
     blocked: [] as KanbanCard[],
     implement: [] as KanbanCard[],
     review: [] as KanbanCard[],
-    testing: [] as KanbanCard[],
     merge: [] as KanbanCard[],
     approval: [] as KanbanCard[],
     done: [] as KanbanCard[],
@@ -249,11 +247,8 @@ export function buildDashboardColumns({
         case "implement":
           buckets.implement.push(card);
           break;
-        case "code_review":
+        case "review":
           buckets.review.push(card);
-          break;
-        case "testing":
-          buckets.testing.push(card);
           break;
         case "merge":
           buckets.merge.push(card);
@@ -270,10 +265,7 @@ export function buildDashboardColumns({
         case "implement":
           buckets.review.push({ ...card, runStatus: "waiting" });
           break;
-        case "code_review":
-          buckets.testing.push({ ...card, runStatus: "waiting" });
-          break;
-        case "testing":
+        case "review":
           buckets.merge.push({ ...card, runStatus: "waiting" });
           break;
         case "merge":

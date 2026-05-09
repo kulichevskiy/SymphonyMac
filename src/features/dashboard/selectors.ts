@@ -11,10 +11,9 @@ import type { DashboardColumn, KanbanCard } from "./types";
 const COLUMN_DEFINITIONS = [
   { id: "open", title: "Open", color: "#8b949e" },
   { id: "blocked", title: "Blocked", color: "#da3633" },
-  { id: "implement", title: "In Progress", color: "#d29922" },
-  { id: "review", title: "Code Review", color: "#bc8cff" },
-  { id: "testing", title: "Testing", color: "#58a6ff" },
-  { id: "merge", title: "Merging", color: "#d2a8ff" },
+  { id: "implement", title: "Implement", color: "#d29922" },
+  { id: "review", title: "Review", color: "#bc8cff" },
+  { id: "merge", title: "Merge", color: "#d2a8ff" },
   { id: "approval", title: "Awaiting Approval", color: "#d29922" },
   { id: "done", title: "Done", color: "#3fb950" },
   { id: "failed", title: "Failed", color: "#f85149" },
@@ -102,11 +101,8 @@ export function buildDashboardColumns(
         case "implement":
           pushCard("implement", card);
           break;
-        case "code_review":
+        case "review":
           pushCard("review", card);
-          break;
-        case "testing":
-          pushCard("testing", card);
           break;
         case "merge":
           pushCard("merge", card);
@@ -123,10 +119,7 @@ export function buildDashboardColumns(
         case "implement":
           pushCard("review", { ...card, runStatus: "waiting" });
           break;
-        case "code_review":
-          pushCard("testing", { ...card, runStatus: "waiting" });
-          break;
-        case "testing":
+        case "review":
           pushCard("merge", { ...card, runStatus: "waiting" });
           break;
         case "merge":

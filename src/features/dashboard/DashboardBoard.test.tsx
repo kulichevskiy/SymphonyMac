@@ -6,7 +6,7 @@ import type { DashboardColumn } from "./types";
 const columns: DashboardColumn[] = [
   {
     id: "review",
-    title: "Code Review",
+    title: "Review",
     color: "#bc8cff",
     items: [
       {
@@ -54,9 +54,9 @@ describe("DashboardBoard", () => {
     const { onAdvanceToStage } = renderBoard(true);
 
     expect(screen.getByText("Ready for manual advance")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Testing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
 
-    expect(onAdvanceToStage).toHaveBeenCalledWith("run-1", "testing");
+    expect(onAdvanceToStage).toHaveBeenCalledWith("run-1", "review");
   });
 
   it("hides manual advance actions while auto-pilot is running", () => {
@@ -64,7 +64,6 @@ describe("DashboardBoard", () => {
 
     expect(screen.getByText("Starting next stage...")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Review" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Testing" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Merge" })).not.toBeInTheDocument();
   });
 });

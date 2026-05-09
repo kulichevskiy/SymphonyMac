@@ -3,6 +3,18 @@ mod process;
 mod prompt;
 mod runtime;
 
+pub mod runtime_helpers {
+    //! Thin wrappers over `runtime` so other modules (e.g. orchestrator/review)
+    //! can append log lines and mutate runs without depending on the private API.
+
+    use super::runtime;
+    use crate::SharedState;
+
+    pub async fn append_log(state: &SharedState, run_id: &str, message: String) {
+        runtime::append_run_log(state, run_id, message, true, true).await;
+    }
+}
+
 use self::pipeline::{
     PipelineCompletionSpec, StageLaunchSpec, prepare_and_register_stage_run, spawn_next_stage,
 };
@@ -15,6 +27,70 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map};
 use tauri::{AppHandle, Emitter};
 use ts_rs::TS;
+
+#[derive(Debug, Clone)]
+pub struct ReviewAdvanceContext {
+    pub run_id: String,
+    pub repo: String,
+    pub issue_number: u64,
+    pub issue_title: String,
+    pub issue_body: String,
+    pub issue_labels: Vec<String>,
+    pub workspace_path: String,
+}
+
+/// Mark a Review-stage run as Completed and spawn the Merge stage.
+/// Called by the orchestrator's review-poll loop when Codex approval is detected.
+pub async fn advance_review_to_merge(
+    app: &AppHandle,
+    state: &SharedState,
+    ctx: ReviewAdvanceContext,
+) {
+    let previous_context = {
+        let s = state.lock().await;
+        s.runs.get(&ctx.run_id).and_then(|run| run.stage_context.clone())
+    };
+
+    let _ = runtime::transition_run(
+        app,
+        state,
+        &ctx.run_id,
+        StatusTransition {
+            status: AgentStatus::Completed,
+            stage_label: PipelineStage::Review.to_string(),
+            error: None,
+            finished: true,
+            log_message: Some("[review] Stage completed; advancing to Merge.".to_string()),
+            pending_next_stage: PendingNextStageUpdate::Clear,
+            emit_extra: Map::new(),
+            persist_meta: true,
+        },
+    )
+    .await;
+
+    let max_retries = {
+        let s = state.lock().await;
+        s.config.max_retries
+    };
+
+    spawn_next_stage(
+        app.clone(),
+        state.clone(),
+        StageLaunchSpec {
+            repo: ctx.repo,
+            issue_number: ctx.issue_number,
+            issue_title: ctx.issue_title,
+            issue_body: ctx.issue_body,
+            stage: PipelineStage::Merge,
+            issue_labels: ctx.issue_labels,
+            workspace_path: std::path::PathBuf::from(ctx.workspace_path),
+            attempt: 1,
+            max_retries,
+            previous_error: String::new(),
+            previous_context,
+        },
+    );
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "contracts.ts")]
@@ -49,26 +125,30 @@ pub async fn launch_agent(
     let workspace_path =
         workspace::ensure_workspace(&repo, issue_number, local_repo_path, &config.hooks)?;
 
-    let request = prepare_and_register_stage_run(
-        &app,
-        &state,
-        &config,
-        StageLaunchSpec {
-            repo: repo.clone(),
-            issue_number,
-            issue_title: issue_title.clone(),
-            issue_body: issue_body.clone(),
-            stage,
-            issue_labels,
-            workspace_path,
-            attempt: 1,
-            max_retries: config.max_retries,
-            previous_error: String::new(),
-            previous_context: None,
-        },
-        Map::new(),
-    )
-    .await;
+    let spec = StageLaunchSpec {
+        repo: repo.clone(),
+        issue_number,
+        issue_title: issue_title.clone(),
+        issue_body: issue_body.clone(),
+        stage: stage.clone(),
+        issue_labels,
+        workspace_path,
+        attempt: 1,
+        max_retries: config.max_retries,
+        previous_error: String::new(),
+        previous_context: None,
+    };
+
+    if matches!(stage, PipelineStage::Review) {
+        // Review stage is handled by the orchestrator polling loop, not by a child agent.
+        let run_id = pipeline::start_review_stage(&app, &state, spec)
+            .await
+            .ok_or_else(|| "Failed to start Review stage".to_string())?;
+        return Ok(run_id);
+    }
+
+    let request =
+        prepare_and_register_stage_run(&app, &state, &config, spec, Map::new()).await;
 
     let run_id = request.run_id.clone();
     let app_clone = app.clone();
@@ -283,10 +363,6 @@ pub async fn approve_stage(
     };
 
     if next_stage == PipelineStage::Done {
-        let skipped_stages = {
-            let s = state.lock().await;
-            crate::orchestrator::compute_skipped_stages(&issue_labels, &s.config.stage_skip_labels)
-        };
         pipeline::finish_pipeline(
             &app,
             state.inner(),
@@ -296,33 +372,35 @@ pub async fn approve_stage(
                 issue_title,
                 workspace_path: std::path::PathBuf::from(workspace_path),
                 issue_labels,
-                skipped_stages,
+                skipped_stages: Vec::new(),
             },
         )
         .await;
         return Ok(());
     }
 
-    spawn_next_stage(
-        app,
-        state.inner().clone(),
-        StageLaunchSpec {
-            repo,
-            issue_number,
-            issue_title,
-            issue_body: body,
-            stage: next_stage,
-            issue_labels,
-            workspace_path: std::path::PathBuf::from(workspace_path),
-            attempt: 1,
-            max_retries: {
-                let s = state.lock().await;
-                s.config.max_retries
-            },
-            previous_error: String::new(),
-            previous_context,
+    let next_spec = StageLaunchSpec {
+        repo,
+        issue_number,
+        issue_title,
+        issue_body: body,
+        stage: next_stage.clone(),
+        issue_labels,
+        workspace_path: std::path::PathBuf::from(workspace_path),
+        attempt: 1,
+        max_retries: {
+            let s = state.lock().await;
+            s.config.max_retries
         },
-    );
+        previous_error: String::new(),
+        previous_context,
+    };
+
+    if matches!(next_stage, PipelineStage::Review) {
+        pipeline::spawn_review_stage(app, state.inner().clone(), next_spec);
+    } else {
+        spawn_next_stage(app, state.inner().clone(), next_spec);
+    }
 
     Ok(())
 }
@@ -549,23 +627,25 @@ pub async fn advance_to_stage(
         Err(_) => String::new(),
     };
 
-    spawn_next_stage(
-        app,
-        state.inner().clone(),
-        StageLaunchSpec {
-            repo,
-            issue_number,
-            issue_title,
-            issue_body: body,
-            stage: effective_stage,
-            issue_labels,
-            workspace_path: std::path::PathBuf::from(workspace_path),
-            attempt: 1,
-            max_retries,
-            previous_error: String::new(),
-            previous_context,
-        },
-    );
+    let next_spec = StageLaunchSpec {
+        repo,
+        issue_number,
+        issue_title,
+        issue_body: body,
+        stage: effective_stage.clone(),
+        issue_labels,
+        workspace_path: std::path::PathBuf::from(workspace_path),
+        attempt: 1,
+        max_retries,
+        previous_error: String::new(),
+        previous_context,
+    };
+
+    if matches!(effective_stage, PipelineStage::Review) {
+        pipeline::spawn_review_stage(app, state.inner().clone(), next_spec);
+    } else {
+        spawn_next_stage(app, state.inner().clone(), next_spec);
+    }
 
     Ok(run_id)
 }
@@ -573,8 +653,7 @@ pub async fn advance_to_stage(
 fn parse_stage(stage_name: &str, allow_done: bool) -> Result<PipelineStage, String> {
     match stage_name {
         "implement" => Ok(PipelineStage::Implement),
-        "code_review" => Ok(PipelineStage::CodeReview),
-        "testing" => Ok(PipelineStage::Testing),
+        "review" => Ok(PipelineStage::Review),
         "merge" => Ok(PipelineStage::Merge),
         "done" if allow_done => Ok(PipelineStage::Done),
         _ => Err(format!("Invalid stage: {}", stage_name)),
@@ -588,10 +667,9 @@ fn can_advance_to_stage(current: &PipelineStage, target: &PipelineStage) -> bool
 fn stage_rank(stage: &PipelineStage) -> u8 {
     match stage {
         PipelineStage::Implement => 0,
-        PipelineStage::CodeReview => 1,
-        PipelineStage::Testing => 2,
-        PipelineStage::Merge => 3,
-        PipelineStage::Done => 4,
+        PipelineStage::Review => 1,
+        PipelineStage::Merge => 2,
+        PipelineStage::Done => 3,
     }
 }
 
@@ -603,18 +681,18 @@ mod tests {
     fn manual_advance_requires_a_later_stage() {
         assert!(can_advance_to_stage(
             &PipelineStage::Implement,
-            &PipelineStage::CodeReview
+            &PipelineStage::Review
         ));
         assert!(can_advance_to_stage(
-            &PipelineStage::CodeReview,
+            &PipelineStage::Review,
             &PipelineStage::Merge
         ));
         assert!(!can_advance_to_stage(
-            &PipelineStage::Testing,
-            &PipelineStage::Testing
+            &PipelineStage::Review,
+            &PipelineStage::Review
         ));
         assert!(!can_advance_to_stage(
-            &PipelineStage::Testing,
+            &PipelineStage::Merge,
             &PipelineStage::Implement
         ));
     }

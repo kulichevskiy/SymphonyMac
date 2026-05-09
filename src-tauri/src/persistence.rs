@@ -88,6 +88,8 @@ pub fn save_state(state: &crate::orchestrator::OrchestratorState) -> Result<(), 
 
 /// Load persisted state from disk.
 /// Any runs that were Running or Preparing are marked as Interrupted.
+/// Any runs persisted in the legacy `code_review` or `testing` stages are migrated
+/// to status `Stopped` with an explanatory error so the user can re-trigger.
 pub fn load_state() -> Option<PersistedState> {
     let path = match state_file_path() {
         Ok(path) => path,
@@ -97,10 +99,42 @@ pub fn load_state() -> Option<PersistedState> {
         }
     };
     let data = fs::read_to_string(&path).ok()?;
-    let mut persisted: PersistedState = serde_json::from_str(&data).ok()?;
+
+    // Detect runs that were persisted at legacy stages (`code_review` / `testing`) before
+    // the new 3-stage pipeline. The PipelineStage deserializer aliases both to `Review`,
+    // so we read the raw JSON first to identify them and then mark them as Stopped.
+    let raw_value: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let legacy_run_ids: Vec<String> = raw_value
+        .get("runs")
+        .and_then(|runs| runs.as_object())
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|(run_id, run)| {
+                    let stage = run.get("stage")?.as_str()?;
+                    if stage == "code_review" || stage == "testing" {
+                        Some(run_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut persisted: PersistedState = serde_json::from_value(raw_value).ok()?;
+
+    let mut modified = !legacy_run_ids.is_empty();
+    for run_id in &legacy_run_ids {
+        if let Some(run) = persisted.runs.get_mut(run_id) {
+            run.status = AgentStatus::Stopped;
+            run.error = Some("Migrated to new pipeline; please re-trigger this issue".to_string());
+            if run.finished_at.is_none() {
+                run.finished_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+        }
+    }
 
     // Mark any in-progress runs as Interrupted since the app restarted
-    let mut modified = false;
     for run in persisted.runs.values_mut() {
         if run.status == AgentStatus::Running || run.status == AgentStatus::Preparing {
             run.status = AgentStatus::Interrupted;
@@ -112,11 +146,11 @@ pub fn load_state() -> Option<PersistedState> {
         }
     }
 
-    // Persist the updated state so Interrupted status is saved to disk
+    // Persist the updated state so the migration is saved to disk.
     if modified {
         if let Err(err) = write_persisted_state(&persisted) {
             eprintln!(
-                "[persistence] Failed to save interrupted run status update: {}",
+                "[persistence] Failed to save migrated run status update: {}",
                 err
             );
         }
@@ -203,6 +237,8 @@ mod tests {
             skipped_stages: vec![],
             stage_context: None,
             pending_next_stage: None,
+            last_pushed_sha: None,
+            last_review_request_at: None,
         }
     }
 
@@ -215,11 +251,11 @@ mod tests {
         );
         runs.insert(
             "run-2".to_string(),
-            make_run("run-2", AgentStatus::Failed, PipelineStage::Testing),
+            make_run("run-2", AgentStatus::Failed, PipelineStage::Review),
         );
 
         let mut approval_gates = HashMap::new();
-        approval_gates.insert("testing".to_string(), true);
+        approval_gates.insert("review".to_string(), true);
         let config = RunConfig {
             agent_type: "codex".to_string(),
             auto_approve: false,
@@ -286,7 +322,7 @@ mod tests {
             make_run(
                 "run-active",
                 AgentStatus::Running,
-                PipelineStage::CodeReview,
+                PipelineStage::Review,
             ),
         );
         runs.insert(
@@ -341,7 +377,7 @@ mod tests {
         let mut runs = HashMap::new();
         runs.insert(
             "r1".to_string(),
-            make_run("r1", AgentStatus::Interrupted, PipelineStage::Testing),
+            make_run("r1", AgentStatus::Interrupted, PipelineStage::Review),
         );
         runs.insert(
             "r2".to_string(),
@@ -376,13 +412,13 @@ mod tests {
 
     #[test]
     fn test_next_resumable_stage_returns_same_stage() {
-        let run = make_run("r1", AgentStatus::Interrupted, PipelineStage::CodeReview);
+        let run = make_run("r1", AgentStatus::Interrupted, PipelineStage::Review);
         let resume = next_resumable_stage(&run);
-        assert_eq!(resume, PipelineStage::CodeReview);
+        assert_eq!(resume, PipelineStage::Review);
 
-        let run2 = make_run("r2", AgentStatus::Interrupted, PipelineStage::Testing);
+        let run2 = make_run("r2", AgentStatus::Interrupted, PipelineStage::Merge);
         let resume2 = next_resumable_stage(&run2);
-        assert_eq!(resume2, PipelineStage::Testing);
+        assert_eq!(resume2, PipelineStage::Merge);
     }
 
     #[test]
@@ -413,7 +449,7 @@ mod tests {
         let mut run = make_run(
             "run-awaiting",
             AgentStatus::AwaitingApproval,
-            PipelineStage::CodeReview,
+            PipelineStage::Review,
         );
         run.error = Some("awaitingapproval".to_string());
         runs.insert("run-awaiting".to_string(), run);
@@ -437,5 +473,134 @@ mod tests {
         let run = loaded.runs.get("run-awaiting").unwrap();
         assert_eq!(run.status, AgentStatus::AwaitingApproval);
         assert_eq!(run.error.as_deref(), Some("awaitingapproval"));
+    }
+
+    #[test]
+    fn test_load_state_migrates_legacy_stages_to_stopped() {
+        // Build a legacy persisted JSON with `code_review` and `testing` stage values, and
+        // exercise the same migration logic that load_state uses.
+        let legacy_json = serde_json::json!({
+            "repos": ["test/repo"],
+            "runs": {
+                "run-cr": {
+                    "id": "run-cr",
+                    "repo": "test/repo",
+                    "issue_number": 1,
+                    "issue_title": "legacy code review",
+                    "status": "running",
+                    "stage": "code_review",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "finished_at": null,
+                    "logs": [],
+                    "workspace_path": "/tmp/test",
+                    "error": null,
+                    "attempt": 1,
+                    "max_retries": 1,
+                    "lines_added": 0,
+                    "lines_removed": 0,
+                    "files_modified_list": [],
+                    "report": null,
+                    "command_display": null,
+                    "agent_type": "claude",
+                    "last_log_line": null,
+                    "log_count": 0,
+                    "activity": null,
+                    "last_log_timestamp": null,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_usd": 0.0,
+                    "issue_labels": [],
+                    "skipped_stages": [],
+                    "stage_context": null,
+                    "pending_next_stage": null,
+                    "last_pushed_sha": null,
+                    "last_review_request_at": null,
+                },
+                "run-t": {
+                    "id": "run-t",
+                    "repo": "test/repo",
+                    "issue_number": 2,
+                    "issue_title": "legacy testing",
+                    "status": "completed",
+                    "stage": "testing",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "finished_at": "2026-01-01T00:01:00Z",
+                    "logs": [],
+                    "workspace_path": "/tmp/test",
+                    "error": null,
+                    "attempt": 1,
+                    "max_retries": 1,
+                    "lines_added": 0,
+                    "lines_removed": 0,
+                    "files_modified_list": [],
+                    "report": null,
+                    "command_display": null,
+                    "agent_type": "claude",
+                    "last_log_line": null,
+                    "log_count": 0,
+                    "activity": null,
+                    "last_log_timestamp": null,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_usd": 0.0,
+                    "issue_labels": [],
+                    "skipped_stages": [],
+                    "stage_context": null,
+                    "pending_next_stage": null,
+                    "last_pushed_sha": null,
+                    "last_review_request_at": null,
+                }
+            },
+        });
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&legacy_json.to_string()).expect("parse raw");
+        let legacy_run_ids: Vec<String> = raw
+            .get("runs")
+            .and_then(|runs| runs.as_object())
+            .map(|runs| {
+                runs.iter()
+                    .filter_map(|(run_id, run)| {
+                        let stage = run.get("stage")?.as_str()?;
+                        if stage == "code_review" || stage == "testing" {
+                            Some(run_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut persisted: PersistedState =
+            serde_json::from_value(raw).expect("deserialize after stage alias");
+
+        for run_id in &legacy_run_ids {
+            if let Some(run) = persisted.runs.get_mut(run_id) {
+                run.status = AgentStatus::Stopped;
+                run.error =
+                    Some("Migrated to new pipeline; please re-trigger this issue".to_string());
+                if run.finished_at.is_none() {
+                    run.finished_at = Some("2026-01-02T00:00:00Z".to_string());
+                }
+            }
+        }
+
+        let migrated_cr = persisted.runs.get("run-cr").expect("run-cr present");
+        let migrated_t = persisted.runs.get("run-t").expect("run-t present");
+
+        assert_eq!(migrated_cr.status, AgentStatus::Stopped);
+        assert_eq!(migrated_cr.stage, PipelineStage::Review);
+        assert_eq!(
+            migrated_cr.error.as_deref(),
+            Some("Migrated to new pipeline; please re-trigger this issue")
+        );
+        assert!(migrated_cr.finished_at.is_some());
+
+        assert_eq!(migrated_t.status, AgentStatus::Stopped);
+        assert_eq!(migrated_t.stage, PipelineStage::Review);
+        assert_eq!(
+            migrated_t.error.as_deref(),
+            Some("Migrated to new pipeline; please re-trigger this issue")
+        );
     }
 }

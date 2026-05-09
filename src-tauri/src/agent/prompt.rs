@@ -42,69 +42,9 @@ Instructions:
 
 Do NOT run tests - that will be handled in a later stage.",
 
-        PipelineStage::CodeReview => "\
-You are a code reviewer for repository {{repo}}.
-
-A Pull Request has been created for issue #{{issue_number}}: {{issue_title}}
-
-Instructions:
-1. Run this command to find the PR for issue #{{issue_number}}:
-   gh pr list --state open --json number,title,headRefName
-2. Check out the PR branch
-3. Review ALL changed files carefully. Look for:
-   - Bugs, logic errors, edge cases
-   - Security issues
-   - Code style and readability
-   - Missing error handling
-   - Performance issues
-4. If you find issues, FIX them directly in the code, commit, and push
-5. If the code looks good or after fixing issues, leave a summary comment on the PR:
-   gh pr comment <PR_NUMBER> --body \"Code review completed. <summary of findings and fixes>\"
-
-Be thorough but practical. Fix real problems, don't nitpick style.",
-
-        PipelineStage::Testing => "\
-You are a test engineer for repository {{repo}}.
-
-A Pull Request for issue #{{issue_number}}: {{issue_title}} has been reviewed and is ready for testing.
-
-Issue description:
-{{issue_body}}
-
-Instructions:
-1. Run this command to find the PR for issue #{{issue_number}}:
-   gh pr list --state open --json number,title,headRefName
-2. Check out the PR branch
-3. Identify the project type and run the appropriate test commands:
-   - Node.js: npm test or npm run test
-   - Python: pytest or python -m pytest
-   - Rust: cargo test
-   - Go: go test ./...
-   - Swift: swift test
-   - Or check package.json / Makefile / README for test instructions
-4. If tests fail:
-   - Analyze the failures
-   - Fix the issues in the code
-   - Commit and push the fixes
-   - Re-run tests to confirm they pass
-5. END-TO-END TESTING (CRITICAL):
-   After existing tests pass, you MUST perform end-to-end validation:
-   a) Read the issue title and description above carefully to understand what was fixed or added.
-   b) If the issue describes a specific bug or feature:
-      - Reproduce the original scenario described in the issue to verify the fix works end-to-end.
-      - For bugs: try to trigger the original bug and confirm it no longer occurs.
-      - For features: exercise the new feature through its intended usage path.
-      - Use the project's actual entry points (CLI commands, API endpoints, scripts, UI) to test, not just unit tests.
-   c) If the issue is too abstract or there is no specific scenario to reproduce:
-      - Perform a quick smoke test: build the project and run its main entry point to verify nothing is broken.
-      - For web apps: start the dev server and verify it loads without errors.
-      - For CLI tools: run the main command with --help or a basic invocation.
-      - For libraries: run a quick import/usage check.
-   d) If E2E testing reveals issues, fix them, commit, push, and re-test.
-6. Comment on the PR with your findings:
-   gh pr comment <PR_NUMBER> --body \"Testing completed. Unit tests: PASS. E2E validation: <describe what you tested and results>. Ready to merge.\"
-
-Make sure ALL tests pass and E2E validation succeeds before finishing.",
+        PipelineStage::Review => "\
+The Review stage is handled by the orchestrator: it pings `@codex review` on the PR and \
+polls for a Codex approval comment. No agent prompt is used at this stage.",
 
         PipelineStage::Merge => "\
 You are a release engineer for repository {{repo}}.
@@ -176,12 +116,12 @@ pub(crate) fn build_prompt(
     }
 }
 
-/// Returns the default prompt templates for all stages.
+/// Returns the default prompt templates for stages that launch an agent process.
+/// The Review stage is handled by the orchestrator's polling loop and is excluded.
 pub fn get_default_prompts() -> HashMap<String, String> {
     let stages = [
         PipelineStage::Implement,
-        PipelineStage::CodeReview,
-        PipelineStage::Testing,
+        PipelineStage::Review,
         PipelineStage::Merge,
     ];
     stages
@@ -298,26 +238,34 @@ mod tests {
 
     #[test]
     fn gh_pr_lookup_prompts_do_not_include_a_trailing_pipe() {
-        for stage in [
-            PipelineStage::CodeReview,
-            PipelineStage::Testing,
-            PipelineStage::Merge,
-        ] {
-            let prompt = build_prompt(
-                &stage,
-                57,
-                "pedrocid/SymphonyMac",
-                "Split agent.rs into focused pipeline and process modules",
-                "",
-                &HashMap::new(),
-                1,
-                "",
-                None,
-            );
+        let prompt = build_prompt(
+            &PipelineStage::Merge,
+            57,
+            "pedrocid/SymphonyMac",
+            "Split agent.rs into focused pipeline and process modules",
+            "",
+            &HashMap::new(),
+            1,
+            "",
+            None,
+        );
 
-            assert!(!prompt.contains("headRefName |"));
-            assert!(!prompt.contains("headRefName to find"));
-        }
+        assert!(!prompt.contains("headRefName |"));
+        assert!(!prompt.contains("headRefName to find"));
+    }
+
+    #[test]
+    fn get_default_prompts_returns_only_three_pipeline_keys() {
+        let prompts = super::get_default_prompts();
+        let mut keys: Vec<String> = prompts.keys().cloned().collect();
+        keys.sort();
+
+        assert_eq!(
+            keys,
+            vec!["implement".to_string(), "merge".to_string(), "review".to_string()]
+        );
+        assert!(!prompts.contains_key("code_review"));
+        assert!(!prompts.contains_key("testing"));
     }
 
     #[test]
@@ -335,7 +283,7 @@ mod tests {
         };
 
         let prompt = build_prompt(
-            &PipelineStage::Testing,
+            &PipelineStage::Merge,
             62,
             "pedrocid/SymphonyMac",
             "Add automated coverage",
@@ -356,12 +304,12 @@ mod tests {
     fn test_build_prompt_uses_custom_stage_template() {
         let mut stage_prompts = HashMap::new();
         stage_prompts.insert(
-            "testing".to_string(),
-            "Custom test plan for {{repo}} issue #{{issue_number}}".to_string(),
+            "merge".to_string(),
+            "Custom merge plan for {{repo}} issue #{{issue_number}}".to_string(),
         );
 
         let prompt = build_prompt(
-            &PipelineStage::Testing,
+            &PipelineStage::Merge,
             62,
             "pedrocid/SymphonyMac",
             "Add automated coverage",
@@ -374,7 +322,7 @@ mod tests {
 
         assert_eq!(
             prompt,
-            "Custom test plan for pedrocid/SymphonyMac issue #62"
+            "Custom merge plan for pedrocid/SymphonyMac issue #62"
         );
     }
 

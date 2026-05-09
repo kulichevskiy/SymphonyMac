@@ -5,8 +5,7 @@ import type { PipelineReport, StageReport } from "../contracts";
 
 const STAGE_COLORS: Record<string, string> = {
   Implement: "#d29922",
-  "Code Review": "#bc8cff",
-  Testing: "#58a6ff",
+  Review: "#bc8cff",
   Merge: "#d2a8ff",
 };
 
@@ -209,19 +208,11 @@ export function PipelineReportView({
           </div>
         </div>
 
-        {/* Code Review Summary */}
-        {report.code_review_summary && (
+        {/* Review Summary */}
+        {report.review_summary && (
           <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-4">
-            <h4 className="text-xs font-semibold text-[#8b949e] uppercase tracking-wider mb-2">Code Review</h4>
-            <p className="text-sm text-[#e6edf3]">{report.code_review_summary}</p>
-          </div>
-        )}
-
-        {/* Testing Summary */}
-        {report.testing_summary && (
-          <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-4">
-            <h4 className="text-xs font-semibold text-[#8b949e] uppercase tracking-wider mb-2">Testing</h4>
-            <p className="text-sm text-[#e6edf3]">{report.testing_summary}</p>
+            <h4 className="text-xs font-semibold text-[#8b949e] uppercase tracking-wider mb-2">Review</h4>
+            <p className="text-sm text-[#e6edf3]">{report.review_summary}</p>
           </div>
         )}
 

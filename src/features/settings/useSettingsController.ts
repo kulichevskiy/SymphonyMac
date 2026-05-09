@@ -21,7 +21,6 @@ export function useSettingsController() {
   const [wsMessage, setWsMessage] = useState<string | null>(null);
   const [defaultPrompts, setDefaultPrompts] = useState<Record<string, string>>({});
   const [expandedStage, setExpandedStage] = useState<string | null>(null);
-  const [newSkipLabel, setNewSkipLabel] = useState("");
 
   useEffect(() => {
     void loadInitialData();
@@ -137,8 +136,6 @@ export function useSettingsController() {
     defaultPrompts,
     expandedStage,
     setExpandedStage,
-    newSkipLabel,
-    setNewSkipLabel,
     saveConfig,
     refreshWorkspaces,
     cleanupSingle,

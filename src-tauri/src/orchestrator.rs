@@ -6,12 +6,11 @@ use tauri::{AppHandle, Emitter};
 use ts_rs::TS;
 
 mod reconciliation;
+mod review;
 mod scan;
 mod scheduler;
 
-pub use scheduler::{
-    can_launch_stage, compute_skipped_stages, is_gate_enabled, next_pipeline_stage,
-};
+pub use scheduler::{can_launch_stage, is_gate_enabled, next_pipeline_stage};
 
 #[derive(Debug, Clone, Serialize, PartialEq, TS)]
 #[serde(rename_all = "snake_case")]
@@ -62,8 +61,11 @@ impl<'de> Deserialize<'de> for AgentStatus {
 #[ts(export, export_to = "contracts.ts")]
 pub enum PipelineStage {
     Implement,
-    CodeReview,
-    Testing,
+    /// Polling stage that waits for Codex approval after pinging `@codex review`.
+    /// Old `code_review` and `testing` persisted values are aliased here so legacy
+    /// runs deserialize cleanly; `persistence::load_state` then marks them Stopped.
+    #[serde(alias = "code_review", alias = "testing")]
+    Review,
     Merge,
     Done,
 }
@@ -72,8 +74,7 @@ impl std::fmt::Display for PipelineStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PipelineStage::Implement => write!(f, "implement"),
-            PipelineStage::CodeReview => write!(f, "code_review"),
-            PipelineStage::Testing => write!(f, "testing"),
+            PipelineStage::Review => write!(f, "review"),
             PipelineStage::Merge => write!(f, "merge"),
             PipelineStage::Done => write!(f, "done"),
         }
@@ -179,10 +180,11 @@ pub struct AgentRun {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
-    /// Labels from the GitHub issue, used for stage-skip logic
+    /// Labels from the GitHub issue (informational; retained for future label-based features).
     #[serde(default)]
     pub issue_labels: Vec<String>,
-    /// Stages that were skipped for this issue based on label rules
+    /// Stages that were skipped for this issue. Always empty in the new 3-stage pipeline;
+    /// preserved on the contract for backward compatibility with persisted runs.
     #[serde(default)]
     pub skipped_stages: Vec<String>,
     /// Structured context from the previous pipeline stage
@@ -190,6 +192,14 @@ pub struct AgentRun {
     /// The next stage to advance to when approval is granted (only set when status is AwaitingApproval)
     #[serde(default)]
     pub pending_next_stage: Option<String>,
+    /// HEAD SHA captured when the Review stage was last (re-)requested.
+    /// Used to ignore stale Codex feedback on prior commits.
+    #[serde(default)]
+    pub last_pushed_sha: Option<String>,
+    /// RFC3339 timestamp of when `@codex review` was last posted for this run.
+    /// Comments before this timestamp are ignored when checking for approval.
+    #[serde(default)]
+    pub last_review_request_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -312,18 +322,21 @@ pub struct RunConfig {
     /// Default: 300 (5 minutes).
     #[serde(default = "default_stall_timeout")]
     pub stall_timeout_secs: u64,
-    /// Label-to-stage skip mappings. When an issue has a label matching a key,
-    /// the listed stages are skipped during auto-chaining.
-    /// Only CodeReview and Testing can be skipped; Implement and Merge are always required.
-    /// Default: {"skip:code-review": ["code_review"], "skip:testing": ["testing"], "docs-only": ["code_review", "testing"]}
-    #[serde(default = "default_stage_skip_labels")]
-    pub stage_skip_labels: HashMap<String, Vec<String>>,
     /// Per-stage approval gates. When a gate is enabled for a stage, the pipeline
     /// pauses after that stage completes and waits for explicit user approval before
-    /// advancing to the next stage. Keys are stage names (implement, code_review,
-    /// testing, merge). Default: all false (fully automatic).
+    /// advancing to the next stage. Keys are stage names (implement, review, merge).
+    /// Default: all false (fully automatic).
     #[serde(default)]
     pub approval_gates: HashMap<String, bool>,
+    /// Substrings (case-insensitive) that mark a Codex review comment as approving.
+    /// When one of these appears in a Codex bot comment newer than `last_review_request_at`,
+    /// the Review stage advances to Merge.
+    #[serde(default = "default_codex_approve_patterns")]
+    pub codex_approve_patterns: Vec<String>,
+    /// Trailing marker Codex appends to its review comments (used as a heuristic for
+    /// identifying review summary comments rather than chatter).
+    #[serde(default = "default_codex_feedback_marker")]
+    pub codex_feedback_marker: String,
     /// Local repository paths. Keys are repo full names (e.g. "owner/repo"),
     /// values are absolute paths to local git repositories. When a repo has a
     /// local path configured, Symphony uses `git worktree add` instead of cloning.
@@ -351,18 +364,16 @@ fn default_stall_timeout() -> u64 {
     300
 }
 
-fn default_stage_skip_labels() -> HashMap<String, Vec<String>> {
-    let mut m = HashMap::new();
-    m.insert(
-        "skip:code-review".to_string(),
-        vec!["code_review".to_string()],
-    );
-    m.insert("skip:testing".to_string(), vec!["testing".to_string()]);
-    m.insert(
-        "docs-only".to_string(),
-        vec!["code_review".to_string(), "testing".to_string()],
-    );
-    m
+fn default_codex_approve_patterns() -> Vec<String> {
+    vec![
+        "Didn't find any major issues".to_string(),
+        "did not find major issues".to_string(),
+        "👍".to_string(),
+    ]
+}
+
+fn default_codex_feedback_marker() -> String {
+    "Useful? React with 👍 / 👎.".to_string()
 }
 
 fn default_retry_base_delay() -> u64 {
@@ -396,8 +407,9 @@ impl Default for RunConfig {
             hooks: LifecycleHooks::default(),
             priority_labels: default_priority_labels(),
             stall_timeout_secs: default_stall_timeout(),
-            stage_skip_labels: default_stage_skip_labels(),
             approval_gates: HashMap::new(),
+            codex_approve_patterns: default_codex_approve_patterns(),
+            codex_feedback_marker: default_codex_feedback_marker(),
             local_repos: HashMap::new(),
             custom_agent_command: String::new(),
         }
@@ -782,6 +794,7 @@ async fn poll_loop(app: AppHandle, state: SharedState, repos: Vec<String>) {
         }
 
         reconciliation::reconcile_active_runs(&app, &state).await;
+        review::poll_review_runs(&app, &state).await;
 
         let _ = app.emit(
             "orchestrator-poll",
@@ -928,9 +941,11 @@ mod tests {
             output_tokens: 800,
             cost_usd: 0.34,
             issue_labels: vec!["enhancement".to_string()],
-            skipped_stages: vec!["testing".to_string()],
+            skipped_stages: vec![],
             stage_context: None,
             pending_next_stage: Some("merge".to_string()),
+            last_pushed_sha: None,
+            last_review_request_at: None,
         }
     }
 
@@ -968,8 +983,7 @@ mod tests {
             pr_number: Some(123),
             pr_url: Some("https://github.com/pedrocid/SymphonyMac/pull/123".to_string()),
             issue_url: "https://github.com/pedrocid/SymphonyMac/issues/55".to_string(),
-            code_review_summary: "large review summary".repeat(20),
-            testing_summary: "large testing summary".repeat(20),
+            review_summary: "large review summary".repeat(20),
             total_input_tokens: 1200,
             total_output_tokens: 800,
             total_cost_usd: 0.34,
@@ -1002,7 +1016,7 @@ mod tests {
             issue_number: 62,
             issue_title: "Add automated coverage".to_string(),
             status: AgentStatus::AwaitingApproval,
-            stage: PipelineStage::CodeReview,
+            stage: PipelineStage::Review,
             started_at: started_at.to_string(),
             finished_at: None,
             logs: vec![],
@@ -1024,9 +1038,11 @@ mod tests {
             output_tokens: 75,
             cost_usd: 0.0123,
             issue_labels: vec!["feature".to_string()],
-            skipped_stages: vec!["testing".to_string()],
+            skipped_stages: vec![],
             stage_context: None,
-            pending_next_stage: Some("testing".to_string()),
+            pending_next_stage: Some("merge".to_string()),
+            last_pushed_sha: None,
+            last_review_request_at: None,
         }
     }
 
@@ -1111,9 +1127,22 @@ mod tests {
             .expect("serialize agent run");
 
         assert_eq!(json["status"], "awaiting_approval");
-        assert_eq!(json["stage"], "code_review");
-        assert_eq!(json["pending_next_stage"], "testing");
-        assert_eq!(json["skipped_stages"], serde_json::json!(["testing"]));
+        assert_eq!(json["stage"], "review");
+        assert_eq!(json["pending_next_stage"], "merge");
+        assert_eq!(json["skipped_stages"], serde_json::json!([]));
+        assert!(json["last_pushed_sha"].is_null());
+        assert!(json["last_review_request_at"].is_null());
+    }
+
+    #[test]
+    fn test_pipeline_stage_aliases_legacy_stages_to_review() {
+        let from_code_review: PipelineStage =
+            serde_json::from_str("\"code_review\"").expect("deserialize legacy code_review");
+        assert_eq!(from_code_review, PipelineStage::Review);
+
+        let from_testing: PipelineStage =
+            serde_json::from_str("\"testing\"").expect("deserialize legacy testing");
+        assert_eq!(from_testing, PipelineStage::Review);
     }
 
     #[test]

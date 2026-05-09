@@ -47,6 +47,23 @@ pub struct PullRequest {
     pub closes_issue: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrComment {
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// Full state of a PR, used by the Review-stage poll loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestFullState {
+    pub number: u64,
+    pub state: String,
+    pub head_ref_name: String,
+    pub head_ref_oid: Option<String>,
+    pub comments: Vec<PrComment>,
+}
+
 #[async_trait]
 pub trait GitHubGateway: Send + Sync {
     async fn list_repos(&self, filter: Option<String>) -> Result<Vec<Repo>, String>;
@@ -524,6 +541,93 @@ pub async fn is_pr_merged_for_issue(repo: &str, issue_number: u64) -> Result<boo
         .await
 }
 
+/// Find an open PR associated with `issue_number` in `repo`. Returns its full state
+/// (number, state, branch, HEAD oid, and comments) — used by the Review stage poll loop.
+pub async fn pr_full_state(
+    repo: &str,
+    issue_number: u64,
+) -> Result<Option<PullRequestFullState>, String> {
+    let json_fields = "number,title,body,state,headRefName,headRefOid,comments";
+    let output = run_gh(&[
+        "pr",
+        "list",
+        "-R",
+        repo,
+        "--state",
+        "all",
+        "--limit",
+        "50",
+        "--json",
+        json_fields,
+    ])
+    .await?;
+
+    let prs: Vec<serde_json::Value> =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse PRs: {}", e))?;
+
+    for pr in prs {
+        let body = pr["body"].as_str().unwrap_or("");
+        let title = pr["title"].as_str().unwrap_or("");
+        let references_issue = parse_closes_issue(body) == Some(issue_number)
+            || parse_issue_from_title(title) == Some(issue_number);
+        if !references_issue {
+            continue;
+        }
+
+        let comments = pr["comments"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| PrComment {
+                        author: item["author"]["login"].as_str().unwrap_or("").to_string(),
+                        body: item["body"].as_str().unwrap_or("").to_string(),
+                        created_at: item["createdAt"].as_str().unwrap_or("").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        return Ok(Some(PullRequestFullState {
+            number: pr["number"].as_u64().unwrap_or(0),
+            state: pr["state"].as_str().unwrap_or("").to_string(),
+            head_ref_name: pr["headRefName"].as_str().unwrap_or("").to_string(),
+            head_ref_oid: pr["headRefOid"].as_str().map(|s| s.to_string()),
+            comments,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// Post `@codex review` as an issue-level comment on the given PR.
+pub async fn post_codex_review(repo: &str, pr_number: u64) -> Result<(), String> {
+    let pr_number_str = pr_number.to_string();
+    let _ = run_gh(&[
+        "pr",
+        "comment",
+        &pr_number_str,
+        "-R",
+        repo,
+        "--body",
+        "@codex review",
+    ])
+    .await?;
+    Ok(())
+}
+
+/// Returns true if `text` matches any of the configured Codex approval `patterns`
+/// (case-insensitive substring match).
+pub fn parse_codex_approval(text: &str, patterns: &[String]) -> bool {
+    if text.is_empty() || patterns.is_empty() {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    patterns
+        .iter()
+        .any(|pattern| !pattern.is_empty() && lower.contains(&pattern.to_lowercase()))
+}
+
 #[tauri::command]
 pub async fn get_issue_detail(repo: String, number: u64) -> Result<Issue, String> {
     cli_gateway().get_issue_detail(&repo, number).await
@@ -662,5 +766,42 @@ mod tests {
         assert!(query.contains("issue_27: issue(number: 27)"));
         assert!(query.contains("owner: \"octo\\\"cat\""));
         assert!(query.contains("name: \"repo-name\""));
+    }
+
+    #[test]
+    fn test_parse_codex_approval_matches_default_patterns_case_insensitively() {
+        let patterns = vec![
+            "Didn't find any major issues".to_string(),
+            "did not find major issues".to_string(),
+            "👍".to_string(),
+        ];
+
+        // exact match (case-insensitive)
+        assert!(parse_codex_approval(
+            "DIDN'T FIND ANY MAJOR ISSUES — looks good to me.",
+            &patterns,
+        ));
+
+        // alt phrasing
+        assert!(parse_codex_approval(
+            "After review, did NOT find major issues.",
+            &patterns,
+        ));
+
+        // emoji marker
+        assert!(parse_codex_approval(
+            "LGTM 👍 from Codex",
+            &patterns,
+        ));
+
+        // no match
+        assert!(!parse_codex_approval(
+            "Found a couple of issues that need fixing.",
+            &patterns,
+        ));
+
+        // empty inputs
+        assert!(!parse_codex_approval("", &patterns));
+        assert!(!parse_codex_approval("anything", &[]));
     }
 }
