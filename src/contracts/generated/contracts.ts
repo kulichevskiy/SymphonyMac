@@ -62,7 +62,23 @@ last_review_request_at: string | null,
  * Number of fix-runs spawned for this Review run in response to Codex feedback.
  * Starts at 0 (no feedback received yet); incremented before each fix-run is spawned.
  */
-review_iteration: number, };
+review_iteration: number, 
+/**
+ * The PR HEAD SHA we most recently spawned a CI-failure fix-run against.
+ * Used by the review-poll loop to dedupe: once a fix-run is in flight for
+ * SHA X's failing checks, don't spawn another for the same SHA. When the
+ * fix-run pushes a new SHA, this no longer matches and the next failure
+ * (if any) on the new SHA can trigger a fresh fix-run.
+ */
+last_ci_failure_sha: string | null, 
+/**
+ * Consecutive failures of `gh pr view --json statusCheckRollup` for this
+ * run. Reset to 0 every time the fetch succeeds. The Merge-gate path
+ * fails the run terminally once this exceeds a threshold so a permanently
+ * broken `gh` (e.g. missing permissions) doesn't silently strand approved
+ * PRs in Review forever.
+ */
+ci_status_fetch_failure_count: number, };
 
 export type AgentStatus = "preparing" | "running" | "completed" | "failed" | "stopped" | "interrupted" | "awaiting_approval";
 

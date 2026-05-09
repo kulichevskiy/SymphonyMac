@@ -204,6 +204,20 @@ pub struct AgentRun {
     /// Starts at 0 (no feedback received yet); incremented before each fix-run is spawned.
     #[serde(default)]
     pub review_iteration: u32,
+    /// The PR HEAD SHA we most recently spawned a CI-failure fix-run against.
+    /// Used by the review-poll loop to dedupe: once a fix-run is in flight for
+    /// SHA X's failing checks, don't spawn another for the same SHA. When the
+    /// fix-run pushes a new SHA, this no longer matches and the next failure
+    /// (if any) on the new SHA can trigger a fresh fix-run.
+    #[serde(default)]
+    pub last_ci_failure_sha: Option<String>,
+    /// Consecutive failures of `gh pr view --json statusCheckRollup` for this
+    /// run. Reset to 0 every time the fetch succeeds. The Merge-gate path
+    /// fails the run terminally once this exceeds a threshold so a permanently
+    /// broken `gh` (e.g. missing permissions) doesn't silently strand approved
+    /// PRs in Review forever.
+    #[serde(default)]
+    pub ci_status_fetch_failure_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
@@ -957,6 +971,8 @@ mod tests {
             last_pushed_sha: None,
             last_review_request_at: None,
             review_iteration: 0,
+            last_ci_failure_sha: None,
+            ci_status_fetch_failure_count: 0,
         }
     }
 
@@ -1055,6 +1071,8 @@ mod tests {
             last_pushed_sha: None,
             last_review_request_at: None,
             review_iteration: 0,
+            last_ci_failure_sha: None,
+            ci_status_fetch_failure_count: 0,
         }
     }
 

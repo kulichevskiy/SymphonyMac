@@ -1,10 +1,33 @@
-use crate::github::{self, PrComment};
+use crate::github::{self, PrCheck, PrCiStatus, PrComment};
 use crate::SharedState;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::AppHandle;
 
 use super::{AgentStatus, PipelineStage};
+
+/// Maximum number of failing checks we surface in a single fix-run prompt.
+/// Cap exists to keep prompts bounded — if more than this fail at once, the
+/// agent fixes the first batch, pushes, and the next poll picks up whatever
+/// remains.
+const MAX_CI_FAILURES_IN_PROMPT: usize = 5;
+
+/// Maximum chars of `gh run view --log-failed` output we paste per failing
+/// check. The issue suggests `head -200` lines; this char budget is roughly
+/// that order of magnitude and protects against pathological one-line logs.
+const CI_LOG_EXCERPT_MAX_CHARS: usize = 4000;
+
+/// Number of consecutive `pr_ci_status` fetch failures we tolerate on a run
+/// that has Codex approval before failing the run terminally. Without this
+/// cutoff, a permanently broken `gh` (e.g. missing checks-read scope) would
+/// strand approved PRs in Review forever, since the approval-path falls
+/// through to `WaitForCiUnknown` on every fetch failure.
+///
+/// Sized so users get ~5 minutes of transient retry headroom at the default
+/// 60s poll interval — enough to absorb a brief network blip, short enough
+/// that a permanent permissions issue surfaces visibly instead of silently
+/// deadlocking the pipeline.
+const CI_STATUS_FETCH_FAILURE_THRESHOLD: u32 = 5;
 
 #[derive(Debug, Clone)]
 struct ReviewRunSnapshot {
@@ -19,6 +42,11 @@ struct ReviewRunSnapshot {
     last_pushed_sha: Option<String>,
     review_iteration: u32,
     stage_context: Option<crate::orchestrator::StageContext>,
+    last_ci_failure_sha: Option<String>,
+    /// Snapshot of the run's consecutive `pr_ci_status` failure counter at the
+    /// start of this poll tick. Used to decide whether a fresh fetch failure
+    /// pushes us over the terminal-failure threshold.
+    ci_status_fetch_failure_count: u32,
 }
 
 pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
@@ -47,6 +75,8 @@ pub async fn poll_review_runs(app: &AppHandle, state: &SharedState) {
                     last_pushed_sha: run.last_pushed_sha.clone(),
                     review_iteration: run.review_iteration,
                     stage_context: run.stage_context.clone(),
+                    last_ci_failure_sha: run.last_ci_failure_sha.clone(),
+                    ci_status_fetch_failure_count: run.ci_status_fetch_failure_count,
                 })
                 .collect();
         (
@@ -106,18 +136,81 @@ async fn check_codex_activity(
         }
     };
 
-    // 0. DIRTY-state takes priority over both approval and feedback — a PR with
-    // hard conflicts cannot be merged, and applying Codex feedback on top of an
-    // unmergeable branch would only churn. Resolve the rebase first; the fix-run
-    // re-requests review on the rebased SHA, so an existing approval (now stale
-    // because HEAD changed) will be re-issued by Codex against the new state.
+    // 0. DIRTY-state takes priority over approval, Codex feedback, AND CI gating —
+    // a PR with hard conflicts cannot be merged, and applying any other fix on
+    // top of an unmergeable branch would only churn. Resolve the rebase first;
+    // the fix-run re-requests review on the rebased SHA, so an existing
+    // approval (now stale because HEAD changed) will be re-issued by Codex
+    // against the new state. CI re-runs against the new HEAD as well.
     if github::pr_is_dirty(pr_state.merge_state_status.as_deref()) {
         try_dispatch_rebase_fix_run(app, state, &snapshot, &pr_state).await;
         return;
     }
 
-    // 1. Approval takes priority — if Codex says LGTM, advance to Merge regardless of
-    // whether earlier comments were feedback.
+    // CI status fetch is best-effort per tick: a transient `gh` failure must
+    // not bring down the rest of the polling loop. When unavailable, we treat
+    // CI as "unknown" and refuse to advance the approval path — we'd rather
+    // wait one more tick than ship without a CI verdict.
+    //
+    // BUT: we also track consecutive failures on the run, so a *permanent*
+    // breakage (e.g. missing `checks:read` scope on `gh`) doesn't silently
+    // deadlock approved PRs in Review forever. Once `WaitForCiUnknown` would
+    // fire AND the counter is over the threshold, we surface a terminal error
+    // on the run instead of looping silently. The counter resets to 0 on every
+    // successful fetch.
+    let ci_status: Option<PrCiStatus> =
+        match github::pr_ci_status(&snapshot.repo, pr_state.number).await {
+            Ok(status) => {
+                if snapshot.ci_status_fetch_failure_count > 0 {
+                    // Reset the counter so a future broken streak starts fresh.
+                    let _ = crate::agent::pipeline_helpers::set_ci_status_fetch_failure_count(
+                        state,
+                        &snapshot.run_id,
+                        0,
+                    )
+                    .await;
+                }
+                Some(status)
+            }
+            Err(error) => {
+                let new_count = snapshot.ci_status_fetch_failure_count.saturating_add(1);
+                let _ = crate::agent::pipeline_helpers::set_ci_status_fetch_failure_count(
+                    state,
+                    &snapshot.run_id,
+                    new_count,
+                )
+                .await;
+                crate::agent::runtime_helpers::append_log(
+                    state,
+                    &snapshot.run_id,
+                    format!(
+                        "[review] Failed to fetch CI status for PR #{}: {} — will retry next tick (failure {} of {}).",
+                        pr_state.number,
+                        error,
+                        new_count,
+                        CI_STATUS_FETCH_FAILURE_THRESHOLD
+                    ),
+                )
+                .await;
+                None
+            }
+        };
+
+    // Effective counter: snapshot value + 1 if this tick's fetch failed.
+    // We need the *post-update* value for the threshold check below.
+    let effective_fetch_failure_count = if ci_status.is_some() {
+        0
+    } else {
+        snapshot.ci_status_fetch_failure_count.saturating_add(1)
+    };
+
+    let head_match =
+        head_sha_matches(snapshot.last_pushed_sha.as_deref(), pr_state.head_ref_oid.as_deref());
+
+    // 1. Approval takes priority — if Codex says LGTM, advance to Merge once
+    //    the CI gate (per issue #4) is also satisfied. If Codex approves but
+    //    CI is failing, we fall through to the fix-run path below so the same
+    //    poll cycle can spawn a CI fix-run instead of stalling.
     if let Some(comment) = find_codex_approval(
         &pr_state.comments,
         snapshot.last_review_request_at.as_deref(),
@@ -126,8 +219,7 @@ async fn check_codex_activity(
     ) {
         // Defense against changes pushed *after* `@codex review`: if HEAD moved,
         // the approval is stale and we wait for a fresh review.
-        if !head_sha_matches(snapshot.last_pushed_sha.as_deref(), pr_state.head_ref_oid.as_deref())
-        {
+        if !head_match {
             crate::agent::runtime_helpers::append_log(
                 state,
                 &snapshot.run_id,
@@ -142,55 +234,130 @@ async fn check_codex_activity(
             return;
         }
 
-        crate::agent::runtime_helpers::append_log(
-            state,
-            &snapshot.run_id,
-            format!(
-                "[review] Codex approval detected at {} — advancing to Merge.",
-                comment.created_at
-            ),
-        )
-        .await;
+        match decide_approval_outcome(ci_status.as_ref()) {
+            ApprovalOutcome::Advance => {
+                crate::agent::runtime_helpers::append_log(
+                    state,
+                    &snapshot.run_id,
+                    format!(
+                        "[review] Codex approval detected at {} and CI is green — advancing to Merge.",
+                        comment.created_at
+                    ),
+                )
+                .await;
 
-        crate::agent::advance_review_to_merge(
-            app,
-            state,
-            crate::agent::ReviewAdvanceContext {
-                run_id: snapshot.run_id,
-                repo: snapshot.repo,
-                issue_number: snapshot.issue_number,
-                issue_title: snapshot.issue_title,
-                issue_body: snapshot.issue_body,
-                issue_labels: snapshot.issue_labels,
-                workspace_path: snapshot.workspace_path,
-            },
-        )
-        .await;
-        return;
+                crate::agent::advance_review_to_merge(
+                    app,
+                    state,
+                    crate::agent::ReviewAdvanceContext {
+                        run_id: snapshot.run_id,
+                        repo: snapshot.repo,
+                        issue_number: snapshot.issue_number,
+                        issue_title: snapshot.issue_title,
+                        issue_body: snapshot.issue_body,
+                        issue_labels: snapshot.issue_labels,
+                        workspace_path: snapshot.workspace_path,
+                    },
+                )
+                .await;
+                return;
+            }
+            ApprovalOutcome::WaitForCi => {
+                crate::agent::runtime_helpers::append_log(
+                    state,
+                    &snapshot.run_id,
+                    format!(
+                        "[review] Codex approval detected at {}, but required CI checks are still pending. Holding in Review.",
+                        comment.created_at
+                    ),
+                )
+                .await;
+                return;
+            }
+            ApprovalOutcome::WaitForCiUnknown => {
+                if ci_fetch_failure_should_terminate(effective_fetch_failure_count) {
+                    let error = format!(
+                        "Codex approved PR #{} but CI status fetch failed {} consecutive times. \
+This usually means `gh pr view --json statusCheckRollup` cannot read the rollup \
+(missing `checks:read` permission, repo restrictions, or a persistent gh outage). \
+Failing the run terminally so the deadlock is visible — fix the underlying \
+permissions/auth and resume manually.",
+                        pr_state.number, effective_fetch_failure_count,
+                    );
+                    crate::agent::runtime_helpers::append_log(
+                        state,
+                        &snapshot.run_id,
+                        format!("[review] {}", error),
+                    )
+                    .await;
+                    crate::agent::pipeline_helpers::fail_review_run_with_error(
+                        app,
+                        state,
+                        &snapshot.run_id,
+                        error,
+                    )
+                    .await;
+                    return;
+                }
+                crate::agent::runtime_helpers::append_log(
+                    state,
+                    &snapshot.run_id,
+                    format!(
+                        "[review] Codex approval detected at {}, but CI status is unknown this tick (failure {} of {}). Holding in Review until CI status can be fetched.",
+                        comment.created_at,
+                        effective_fetch_failure_count,
+                        CI_STATUS_FETCH_FAILURE_THRESHOLD,
+                    ),
+                )
+                .await;
+                return;
+            }
+            ApprovalOutcome::CiFailing => {
+                crate::agent::runtime_helpers::append_log(
+                    state,
+                    &snapshot.run_id,
+                    format!(
+                        "[review] Codex approval detected at {} but CI is failing — not advancing to Merge. Will spawn fix-run for the failing checks.",
+                        comment.created_at
+                    ),
+                )
+                .await;
+                // Fall through into the fix-run path below; the CI-failure
+                // collector will pick up the failing checks.
+            }
+        }
     }
 
-    // 2. No approval — look for actionable feedback comments and spawn a fix-run.
-    //
-    // Refuse to fix-run when we don't have a `last_review_request_at` baseline
-    // (legacy persisted Review runs, or a run observed before its first
-    // `@codex review` post wrote the field). Without a baseline,
-    // `collect_codex_feedback` would treat *every* historical Codex comment as
-    // new and could force-push fixes for stale feedback that's already been
-    // addressed in a prior cycle. Approval doesn't have this hazard (an
-    // outdated approval is gated by the `head_sha_matches` check), so we only
-    // bail out of the feedback path here.
-    let Some(baseline_ts) = snapshot.last_review_request_at.as_deref() else {
-        return;
+    // 2. Determine fix-run signals. A fix-run can be triggered by Codex
+    //    feedback comments, by failing CI, or both at once.
+
+    // Codex feedback path requires a baseline timestamp — without one, we'd
+    // treat *every* historical Codex comment as new and force-push fixes for
+    // stale feedback. CI failures don't have this hazard (they're keyed by
+    // SHA, not by comment time), so we still allow CI-only fix-runs when the
+    // baseline is missing (e.g. legacy persisted Review runs).
+    let feedback_comments = match snapshot.last_review_request_at.as_deref() {
+        Some(baseline_ts) => collect_codex_feedback(
+            &pr_state.comments,
+            Some(baseline_ts),
+            approve_patterns,
+            feedback_marker,
+        ),
+        None => Vec::new(),
     };
 
-    let feedback_comments = collect_codex_feedback(
-        &pr_state.comments,
-        Some(baseline_ts),
-        approve_patterns,
-        feedback_marker,
+    let failing_check_refs: Vec<&PrCheck> = ci_status
+        .as_ref()
+        .map(|s| s.failing_checks())
+        .unwrap_or_default();
+
+    let should_spawn_for_ci = should_trigger_ci_fix_run(
+        &failing_check_refs,
+        pr_state.head_ref_oid.as_deref(),
+        snapshot.last_ci_failure_sha.as_deref(),
     );
 
-    if feedback_comments.is_empty() {
+    if feedback_comments.is_empty() && !should_spawn_for_ci {
         return;
     }
 
@@ -198,12 +365,12 @@ async fn check_codex_activity(
     // (or some other process) pushed to this branch. Don't fire a fix-run on
     // top — we don't know what that push contained, and force-pushing over it
     // could destroy work. Wait until the human investigates.
-    if !head_sha_matches(snapshot.last_pushed_sha.as_deref(), pr_state.head_ref_oid.as_deref()) {
+    if !head_match {
         crate::agent::runtime_helpers::append_log(
             state,
             &snapshot.run_id,
             format!(
-                "[review] Detected Codex feedback but PR HEAD ({}) differs from last reviewed SHA ({}). Skipping fix-run — external push detected.",
+                "[review] Detected fix-run trigger but PR HEAD ({}) differs from last reviewed SHA ({}). Skipping fix-run — external push detected.",
                 pr_state.head_ref_oid.as_deref().unwrap_or("unknown"),
                 snapshot.last_pushed_sha.as_deref().unwrap_or("unknown"),
             ),
@@ -235,17 +402,39 @@ async fn check_codex_activity(
         crate::agent::runtime_helpers::append_log(
             state,
             &snapshot.run_id,
-            "[review] Detected Codex feedback but another Review run is already active for this issue — skipping fix-run spawn this tick."
+            "[review] Detected fix-run trigger but another Review run is already active for this issue — skipping fix-run spawn this tick."
                 .to_string(),
         )
         .await;
         return;
     }
 
-    let feedback_text = format_feedback_for_prompt(&feedback_comments);
+    // Build the per-check CI failure context now that we've cleared the gates.
+    // Fetching log excerpts is best-effort and serial — we cap the number of
+    // checks to keep the prompt bounded.
+    let ci_failure_contexts = if should_spawn_for_ci {
+        build_ci_failure_contexts(&snapshot.repo, &failing_check_refs).await
+    } else {
+        Vec::new()
+    };
+
+    let feedback_text = if feedback_comments.is_empty() {
+        String::new()
+    } else {
+        format_feedback_for_prompt(&feedback_comments)
+    };
     let pr_number = pr_state.number;
     let branch_name = pr_state.head_ref_name.clone();
     let next_iteration = snapshot.review_iteration.saturating_add(1);
+
+    let log_message = format!(
+        "[review] Spawning fix-run iteration {}: {} Codex feedback comment{}, {} failing CI check{}.",
+        next_iteration,
+        feedback_comments.len(),
+        if feedback_comments.len() == 1 { "" } else { "s" },
+        ci_failure_contexts.len(),
+        if ci_failure_contexts.len() == 1 { "" } else { "s" },
+    );
 
     // Increment review_iteration AND drop the run out of `Running` BEFORE we
     // tokio::spawn the fix-run agent. The poll loop filters by `status ==
@@ -255,12 +444,6 @@ async fn check_codex_activity(
     // it will see the run is no longer in `Running` and skip it. The fix-run
     // path inside `run_agent_process` keeps the run in `Preparing` until
     // `finalize_fix_run_success` flips it back.
-    let log_message = format!(
-        "[review] Codex feedback detected ({} comment{}). Spawning fix-run iteration {}.",
-        feedback_comments.len(),
-        if feedback_comments.len() == 1 { "" } else { "s" },
-        next_iteration,
-    );
     let _ = crate::agent::runtime_helpers::append_log(state, &snapshot.run_id, log_message).await;
     let _ = crate::agent::pipeline_helpers::set_review_iteration(
         state,
@@ -268,6 +451,19 @@ async fn check_codex_activity(
         next_iteration,
     )
     .await;
+    if should_spawn_for_ci {
+        // Mark the SHA we're spawning a CI fix-run against so subsequent polls
+        // on the same SHA don't re-spawn while the fix-run is in flight or
+        // after it completes without pushing. A successful fix-run pushes a
+        // new SHA, which naturally won't match this stored value.
+        let new_sha = pr_state.head_ref_oid.clone();
+        let _ = crate::agent::pipeline_helpers::set_last_ci_failure_sha(
+            state,
+            &snapshot.run_id,
+            new_sha,
+        )
+        .await;
+    }
     crate::agent::pipeline_helpers::mark_review_run_dispatching_fix_run(
         app,
         state,
@@ -290,6 +486,7 @@ async fn check_codex_activity(
             branch_name,
             payload: crate::agent::pipeline_helpers::FixRunPayload::Feedback {
                 feedback: feedback_text,
+                ci_failures: ci_failure_contexts,
             },
         },
     );
@@ -398,6 +595,93 @@ async fn try_dispatch_rebase_fix_run(
             },
         },
     );
+}
+
+/// What the orchestrator should do when Codex has approved but we still need
+/// to consult the CI gate (per issue #4: approval alone does not advance to
+/// Merge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalOutcome {
+    /// CI is green (or there are no checks). Safe to advance to Merge.
+    Advance,
+    /// CI status fetch failed this tick. Hold and retry next tick.
+    WaitForCiUnknown,
+    /// At least one required check is still pending and nothing has failed.
+    /// Hold in Review and wait for CI to settle.
+    WaitForCi,
+    /// At least one check is failing. Don't advance — let the fix-run path
+    /// pick up the failing checks.
+    CiFailing,
+}
+
+/// True when the consecutive CI-status-fetch failure count has reached the
+/// terminal threshold. Extracted as a free function so the boundary is
+/// directly unit-testable and the constant lives in one place.
+fn ci_fetch_failure_should_terminate(failure_count: u32) -> bool {
+    failure_count >= CI_STATUS_FETCH_FAILURE_THRESHOLD
+}
+
+fn decide_approval_outcome(ci_status: Option<&PrCiStatus>) -> ApprovalOutcome {
+    let Some(status) = ci_status else {
+        return ApprovalOutcome::WaitForCiUnknown;
+    };
+    if !status.failing_checks().is_empty() {
+        return ApprovalOutcome::CiFailing;
+    }
+    if status.is_green() {
+        return ApprovalOutcome::Advance;
+    }
+    // Not green and not failing — by construction (see PrCiStatus::is_green),
+    // that means at least one required check is still pending.
+    ApprovalOutcome::WaitForCi
+}
+
+/// Whether this poll tick should spawn a CI-failure fix-run.
+///
+/// Triggers exactly when:
+/// - There is at least one failing check on the PR, AND
+/// - We can identify the current PR HEAD SHA, AND
+/// - That SHA differs from the SHA we last spawned a CI fix-run against.
+///
+/// The SHA dedupe is what stops infinite re-spawns when a fix-run finishes
+/// without pushing (or pushes a fix that doesn't actually green CI).
+fn should_trigger_ci_fix_run(
+    failing_checks: &[&PrCheck],
+    current_head: Option<&str>,
+    last_ci_failure_sha: Option<&str>,
+) -> bool {
+    if failing_checks.is_empty() {
+        return false;
+    }
+    let Some(current) = current_head else {
+        return false;
+    };
+    match last_ci_failure_sha {
+        Some(prev) if prev == current => false,
+        _ => true,
+    }
+}
+
+async fn build_ci_failure_contexts(
+    repo: &str,
+    failing_checks: &[&PrCheck],
+) -> Vec<crate::agent::CiFailureContext> {
+    let mut out = Vec::with_capacity(failing_checks.len().min(MAX_CI_FAILURES_IN_PROMPT));
+    for check in failing_checks.iter().take(MAX_CI_FAILURES_IN_PROMPT) {
+        let log_excerpt = match check.run_id.as_deref() {
+            Some(run_id) => {
+                github::run_failure_log_excerpt(repo, run_id, CI_LOG_EXCERPT_MAX_CHARS).await
+            }
+            None => None,
+        };
+        out.push(crate::agent::CiFailureContext {
+            name: check.name.clone(),
+            state: format!("{:?}", check.state).to_uppercase(),
+            log_excerpt,
+            details_url: check.details_url.clone(),
+        });
+    }
+    out
 }
 
 /// Find the first Codex bot comment newer than `baseline_ts` that contains an
@@ -574,6 +858,109 @@ mod tests {
         assert!(!is_codex_author("kulichevskiy"));
     }
 
+    fn pr_check(
+        name: &str,
+        state: github::CheckState,
+        is_required: bool,
+        run_id: Option<&str>,
+    ) -> github::PrCheck {
+        github::PrCheck {
+            name: name.to_string(),
+            state,
+            is_required,
+            run_id: run_id.map(|s| s.to_string()),
+            details_url: None,
+        }
+    }
+
+    #[test]
+    fn decide_approval_outcome_advances_when_ci_is_green() {
+        let status = github::PrCiStatus::default();
+        assert_eq!(decide_approval_outcome(Some(&status)), ApprovalOutcome::Advance);
+    }
+
+    #[test]
+    fn decide_approval_outcome_holds_when_ci_status_is_unknown() {
+        // We can't tell if it's safe to advance without a CI verdict — refuse
+        // to advance rather than ship without one.
+        assert_eq!(decide_approval_outcome(None), ApprovalOutcome::WaitForCiUnknown);
+    }
+
+    #[test]
+    fn decide_approval_outcome_holds_when_required_check_pending() {
+        let status = github::PrCiStatus {
+            checks: vec![
+                pr_check("build", github::CheckState::Success, true, None),
+                pr_check("test", github::CheckState::Pending, true, None),
+            ],
+        };
+        assert_eq!(decide_approval_outcome(Some(&status)), ApprovalOutcome::WaitForCi);
+    }
+
+    #[test]
+    fn decide_approval_outcome_falls_through_to_fix_run_when_ci_is_failing() {
+        let status = github::PrCiStatus {
+            checks: vec![
+                pr_check("build", github::CheckState::Failure, true, None),
+            ],
+        };
+        assert_eq!(decide_approval_outcome(Some(&status)), ApprovalOutcome::CiFailing);
+    }
+
+    #[test]
+    fn ci_fetch_failure_should_terminate_only_at_or_above_threshold() {
+        // Below threshold: keep retrying. The orchestrator stays in
+        // WaitForCiUnknown and logs "failure N of THRESHOLD".
+        for count in 0..CI_STATUS_FETCH_FAILURE_THRESHOLD {
+            assert!(
+                !ci_fetch_failure_should_terminate(count),
+                "count {count} should NOT terminate (threshold is {CI_STATUS_FETCH_FAILURE_THRESHOLD})",
+            );
+        }
+        // At threshold: terminate. This is the boundary Codex's P1 was about —
+        // we must not keep silently retrying when `gh` is permanently broken.
+        assert!(ci_fetch_failure_should_terminate(
+            CI_STATUS_FETCH_FAILURE_THRESHOLD
+        ));
+        // Far above threshold: still terminate (defensive against counter math
+        // overshoot).
+        assert!(ci_fetch_failure_should_terminate(
+            CI_STATUS_FETCH_FAILURE_THRESHOLD + 100
+        ));
+    }
+
+    #[test]
+    fn should_trigger_ci_fix_run_only_when_failures_present_and_sha_is_new() {
+        let failing_with_run =
+            pr_check("build", github::CheckState::Failure, true, Some("9999"));
+        let failing_refs = vec![&failing_with_run];
+
+        // No failures: never trigger.
+        assert!(!should_trigger_ci_fix_run(&[], Some("sha-1"), None));
+        // Failures + new SHA + no prior CI fix-run: trigger.
+        assert!(should_trigger_ci_fix_run(
+            &failing_refs,
+            Some("sha-1"),
+            None
+        ));
+        // Failures + same SHA we already kicked a fix-run for: dedupe (don't
+        // re-spawn while the fix-run is in flight or hasn't pushed yet).
+        assert!(!should_trigger_ci_fix_run(
+            &failing_refs,
+            Some("sha-1"),
+            Some("sha-1")
+        ));
+        // Failures + different SHA than the one we last spawned for: trigger
+        // again — fix-run pushed a new commit but CI is still red.
+        assert!(should_trigger_ci_fix_run(
+            &failing_refs,
+            Some("sha-2"),
+            Some("sha-1")
+        ));
+        // Failures but unknown current HEAD: can't safely dedupe, skip this tick.
+        assert!(!should_trigger_ci_fix_run(&failing_refs, None, None));
+    }
+
     #[test]
     fn head_sha_matches_accepts_when_reviewed_and_current_agree() {
         assert!(head_sha_matches(Some("abc123"), Some("abc123")));
@@ -631,6 +1018,8 @@ mod tests {
             last_pushed_sha: None,
             last_review_request_at: None,
             review_iteration: 0,
+            last_ci_failure_sha: None,
+            ci_status_fetch_failure_count: 0,
         }
     }
 
