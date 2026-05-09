@@ -340,12 +340,16 @@ fn newer_than(comment_at: &str, baseline: Option<&str>) -> bool {
 }
 
 /// Double-spawn guard: returns true when `candidate_run` (a record from the
-/// orchestrator state) represents an *active* Review run for `target_repo` /
+/// orchestrator state) represents an *in-flight fix-run* for `target_repo` /
 /// `target_issue` that isn't the polling sentinel itself (`target_run_id`).
 ///
-/// "Active" here means status Running or Preparing. We use this to refuse a
-/// fix-run spawn when one is already in flight — preventing the case where two
-/// agents would race to push to the same branch.
+/// We deliberately match only `Preparing` here, not `Running`. The polling
+/// sentinel itself stays in `Running`, so treating sibling Review runs in
+/// `Running` as active siblings would deadlock when two sentinels exist for
+/// the same issue (each sees the other as active and never spawns a fix-run).
+/// Fix-runs flip the run to `Preparing` synchronously before `tokio::spawn`
+/// and stay there for the entire subprocess lifetime — that's exactly the
+/// state we want to guard against.
 #[allow(clippy::too_many_arguments)]
 fn another_review_active(
     candidate_repo: &str,
@@ -361,10 +365,7 @@ fn another_review_active(
         && candidate_issue == target_issue
         && candidate_stage == &PipelineStage::Review
         && candidate_run_id != target_run_id
-        && matches!(
-            candidate_status,
-            AgentStatus::Running | AgentStatus::Preparing
-        )
+        && matches!(candidate_status, AgentStatus::Preparing)
 }
 
 /// Returns true when the PR's current HEAD matches the SHA we recorded at the
@@ -448,9 +449,9 @@ mod tests {
     }
 
     #[test]
-    fn another_review_active_flags_sibling_review_run_for_same_issue() {
+    fn another_review_active_flags_sibling_fix_run_in_preparing() {
         // Same repo+issue, Review stage, Preparing — that's a sibling fix-run
-        // about to start; we must not double-spawn.
+        // already dispatched. We must not double-spawn against it.
         assert!(another_review_active(
             "kulichevskiy/SymphonyMac",
             42,
@@ -461,7 +462,14 @@ mod tests {
             42,
             "self-run-id",
         ));
-        assert!(another_review_active(
+    }
+
+    #[test]
+    fn another_review_active_does_not_flag_sibling_polling_sentinels() {
+        // A second polling sentinel in `Running` for the same issue is not an
+        // in-flight fix-run. Treating it as active would deadlock when two
+        // sentinels see each other and refuse to dispatch.
+        assert!(!another_review_active(
             "kulichevskiy/SymphonyMac",
             42,
             "sibling-run-id",
@@ -522,9 +530,13 @@ mod tests {
     }
 
     #[test]
-    fn another_review_active_skips_terminal_statuses() {
-        // Failed/Completed/Stopped Review runs aren't doing work — don't block.
+    fn another_review_active_skips_non_preparing_statuses() {
+        // Only `Preparing` indicates an in-flight fix-run. Every other status —
+        // including a sibling polling sentinel in `Running` — must NOT block,
+        // otherwise we'd deadlock when two Review records exist for the same
+        // issue. Terminal/idle statuses obviously aren't doing work.
         for status in [
+            AgentStatus::Running,
             AgentStatus::Completed,
             AgentStatus::Failed,
             AgentStatus::Stopped,
