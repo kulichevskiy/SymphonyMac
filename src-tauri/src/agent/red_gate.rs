@@ -240,7 +240,7 @@ pub async fn run_red_gate(
         }
     };
 
-    let red_sha = match find_first_test_only_commit(workspace, &commit_log).await {
+    let red_sha = match find_red_commit(workspace, &commit_log).await {
         Ok(Some(sha)) => sha,
         Ok(None) => {
             return RedGateOutcome::Failed(FailureReason::NoTestOnlyCommit);
@@ -364,17 +364,24 @@ async fn list_commit_files(workspace: &Path, sha: &str) -> Result<Vec<String>, S
     Ok(parse_name_only(&output))
 }
 
-async fn find_first_test_only_commit(
+/// Inspect the *earliest* non-merge commit on the PR branch and return its SHA
+/// when it modifies only test files. The gate's contract is that commit 1 of
+/// the branch is the red commit; a mixed or production-first commit fails the
+/// gate immediately, even if a later commit is test-only. The agent prompt
+/// promises this ordering — the gate enforces it literally.
+async fn find_red_commit(
     workspace: &Path,
     commits: &[String],
 ) -> Result<Option<String>, String> {
-    for sha in commits {
-        let files = list_commit_files(workspace, sha).await?;
-        if diff_is_test_only(&files) {
-            return Ok(Some(sha.clone()));
-        }
+    let Some(first) = commits.first() else {
+        return Ok(None);
+    };
+    let files = list_commit_files(workspace, first).await?;
+    if diff_is_test_only(&files) {
+        Ok(Some(first.clone()))
+    } else {
+        Ok(None)
     }
-    Ok(None)
 }
 
 async fn capture_head(workspace: &Path) -> Result<String, String> {
@@ -701,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn find_first_test_only_commit_locates_red_commit() {
+    fn find_red_commit_locates_red_commit() {
         let dir = TempDir::new().unwrap();
         let repo = init_repo(&dir);
 
@@ -718,13 +725,45 @@ mod tests {
             .block_on(list_commits_since_base(&repo, "origin/main"))
             .unwrap();
         let red = runtime
-            .block_on(find_first_test_only_commit(&repo, &commits))
+            .block_on(find_red_commit(&repo, &commits))
             .unwrap();
         assert!(red.is_some(), "expected to find a test-only commit");
     }
 
     #[test]
-    fn find_first_test_only_commit_returns_none_when_first_commit_mixes_files() {
+    fn find_red_commit_rejects_mixed_first_commit_even_when_later_commit_is_test_only() {
+        // Codex P1: the gate must enforce that the *earliest* commit is
+        // test-only, not just that *some* commit is test-only.
+        let dir = TempDir::new().unwrap();
+        let repo = init_repo(&dir);
+
+        // Commit 1: production-first (violates TDD).
+        write(&repo, "src/lib.rs", "pub fn answer() -> i32 { 42 }\n");
+        run(&repo, &["add", "src/lib.rs"]);
+        run(&repo, &["commit", "-q", "-m", "feat: production first"]);
+
+        // Commit 2: test-only, retroactively added.
+        write(
+            &repo,
+            "tests/integration.rs",
+            "#[test]\nfn red() { assert_eq!(2, 1 + 1); }\n",
+        );
+        run(&repo, &["add", "tests/integration.rs"]);
+        run(&repo, &["commit", "-q", "-m", "test: backfilled"]);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let commits = runtime
+            .block_on(list_commits_since_base(&repo, "origin/main"))
+            .unwrap();
+        let red = runtime.block_on(find_red_commit(&repo, &commits)).unwrap();
+        assert!(
+            red.is_none(),
+            "first commit modified production code, gate must reject the branch"
+        );
+    }
+
+    #[test]
+    fn find_red_commit_returns_none_when_first_commit_mixes_files() {
         let dir = TempDir::new().unwrap();
         let repo = init_repo(&dir);
 
@@ -738,7 +777,7 @@ mod tests {
             .block_on(list_commits_since_base(&repo, "origin/main"))
             .unwrap();
         let red = runtime
-            .block_on(find_first_test_only_commit(&repo, &commits))
+            .block_on(find_red_commit(&repo, &commits))
             .unwrap();
         assert!(red.is_none(), "first commit mixed prod+test, gate must miss");
     }
